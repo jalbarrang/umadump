@@ -112,6 +112,24 @@ Override with `--metadata-path` when using a minidump from a different machine.
 
 ---
 
+## Interactive interface
+
+Install the dependencies, then launch the optional Textual dashboard:
+
+```powershell
+pip install -r requirements.txt
+python main.py --tui
+```
+
+The dashboard provides run-once and daemon controls, per-export status, validation logs,
+and the current output directory. Existing command-line behavior remains available without
+`--tui`, which is useful for scripts and line-oriented accessibility tools.
+
+```powershell
+# Open the dashboard with daemon mode selected
+python main.py --tui --rerun-mode daemon --poll-interval 2
+```
+
 ## Usage
 
 ```powershell

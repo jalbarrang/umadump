@@ -1,1 +1,2 @@
 minidump~=0.0.24
+textual~=8.2

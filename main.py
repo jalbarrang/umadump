@@ -15,7 +15,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional, cast as type_cast
+from typing import Any, Callable, Literal, Optional, cast as type_cast
 
 from ctypes_utils import C_Ptr, StructOrSimple
 from game_structs import (RaceManagerObject, RaceManagerSingletonStaticFields, RaceManagerStaticFields,
@@ -44,6 +44,10 @@ from update_check import CURRENT_VERSION, notify_if_update_available
 # ---------------------------------------------------------------------------
 # Misc Utils
 # ---------------------------------------------------------------------------
+
+# Every extractor writes below this folder (relative to the working directory).
+EXPORTS_DIR = Path("exports")
+
 
 def _write_json_file(name: str, output_path: Path, payload: Any) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -222,6 +226,26 @@ class Extractor[TExtractorInput, TExtractionData: FingerprintableExtractionData,
     writer: Optional[Callable[[Path, str, TMultiOutputPayload], None]] = None
 
 
+ExtractorRunStatus = Literal["written", "unchanged", "unavailable", "empty", "transient", "error"]
+
+
+@dataclass(frozen=True)
+class ExtractorRunResult:
+    """Structured outcome for one extractor, consumed by CLI and interactive frontends."""
+
+    name: str
+    status: ExtractorRunStatus
+    output_paths: tuple[Path, ...] = ()
+    item_count: Optional[int] = None
+    error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ExtractionPassResult:
+    elapsed_seconds: float
+    extractors: tuple[ExtractorRunResult, ...]
+
+
 @dataclass
 class ExtractionRunState:
     fingerprints: dict[str, ExtractorFingerprint] = field(default_factory=dict)
@@ -256,35 +280,50 @@ class ExtractionContext:
 def _run_extractors(
         extractors: tuple[Extractor[Any, Any, Any], ...],
         data: Any,
-        state: Optional[ExtractionRunState] = None) -> None:
-    """Run a sequence of extractors against *data*, writing output as configured."""
+        state: Optional[ExtractionRunState] = None,
+        cancel_requested: Optional[Callable[[], bool]] = None) -> tuple[ExtractorRunResult, ...]:
+    """Run a sequence of extractors and return structured outcomes for frontends."""
+    results: list[ExtractorRunResult] = []
     for extractor in extractors:
-        _run_extractor(extractor, data, state)
+        if cancel_requested is not None and cancel_requested():
+            raise InterruptedError("Extraction cancelled")
+        results.append(_run_extractor(extractor, data, state))
+    return tuple(results)
 
 
 def _run_extractor[TExtractionData: FingerprintableExtractionData](
         extractor: Extractor[Any, TExtractionData, Any],
         data: Any,
-        state: Optional[ExtractionRunState]) -> None:
+        state: Optional[ExtractionRunState]) -> ExtractorRunResult:
     try:
         extraction_data = extractor.resolve(data)
         if extraction_data is None:
             logger.debug("%s: extraction data unavailable; skipping write", extractor.name)
-            return
+            return ExtractorRunResult(extractor.name, "unavailable")
 
         fingerprint = extraction_data.fingerprint()
         if _skip_unchanged_extractor(extractor.name, fingerprint, state):
-            return
+            return ExtractorRunResult(extractor.name, "unchanged")
 
         logger.info("Running extractor: %s", extractor.name)
         payload = extractor.extract(extraction_data)
         if state is not None:
             state.record(extractor.name, fingerprint)
-        _write_extractor_payload(extractor, payload)
+        output_paths = _write_extractor_payload(extractor, payload)
+        if not output_paths:
+            return ExtractorRunResult(extractor.name, "empty", item_count=_payload_item_count(payload))
+        return ExtractorRunResult(
+                extractor.name,
+                "written",
+                output_paths=output_paths,
+                item_count=_payload_item_count(payload),
+        )
     except (TransientMemoryReadError, TransientRuntimeValidationError) as exc:
         logger.warning("%s: transient memory state; extraction skipped: %s", extractor.name, exc)
-    except Exception:
+        return ExtractorRunResult(extractor.name, "transient", error=str(exc))
+    except Exception as exc:
         logger.exception("Error in extractor %s", extractor.name)
+        return ExtractorRunResult(extractor.name, "error", error=str(exc))
 
 
 def _skip_unchanged_extractor(
@@ -297,22 +336,25 @@ def _skip_unchanged_extractor(
     return True
 
 
-def _write_extractor_payload(extractor: Extractor[Any, Any, Any], payload: Any) -> None:
+def _write_extractor_payload(extractor: Extractor[Any, Any, Any], payload: Any) -> tuple[Path, ...]:
     if _is_empty_payload(payload):
         logger.debug("%s: empty payload; skipping write", extractor.name)
-        return
+        return ()
     if extractor.output_path is not None:
         _write_json_file(extractor.name, extractor.output_path, payload)
-    elif extractor.output_folder is not None and extractor.key_fn is not None:
-        _write_multi_output_payloads(extractor, payload)
+        return (extractor.output_path,)
+    if extractor.output_folder is not None and extractor.key_fn is not None:
+        return _write_multi_output_payloads(extractor, payload)
+    return ()
 
 
-def _write_multi_output_payloads(extractor: Extractor[Any, Any, Any], payload: Any) -> None:
+def _write_multi_output_payloads(extractor: Extractor[Any, Any, Any], payload: Any) -> tuple[Path, ...]:
     if extractor.output_folder is None or extractor.key_fn is None:
-        return
+        return ()
     extractor.output_folder.mkdir(parents=True, exist_ok=True)
     writer = extractor.writer or _write_multi_output_json
     payloads = payload if isinstance(payload, list) else [payload]
+    output_paths: list[Path] = []
     for item in payloads:
         if _is_empty_payload(item):
             logger.debug("%s: empty multi-output item; skipping write", extractor.name)
@@ -320,6 +362,16 @@ def _write_multi_output_payloads(extractor: Extractor[Any, Any, Any], payload: A
         key = extractor.key_fn(item)
         if key:
             writer(extractor.output_folder, key, item)
+            output_paths.append(extractor.output_folder / f"{key}.json")
+    return tuple(output_paths)
+
+
+def _payload_item_count(payload: Any) -> Optional[int]:
+    if isinstance(payload, (list, tuple, set)):
+        return len(payload)
+    if isinstance(payload, dict):
+        return 1
+    return None
 
 
 def _is_empty_payload(payload: Any) -> bool:
@@ -445,37 +497,37 @@ def _write_idle_single_mode_json(output_folder: Path, key: str, ism: IdleSingleM
 EXTRACTORS: tuple[Extractor[Any, Any, Any], ...] = (
     Extractor(
             name="support_cards",
-            output_path=Path("support_card_data.json"),
+            output_path=EXPORTS_DIR / "support_card_data.json",
             resolve=_resolve_support_cards,
             extract=_extract_support_cards,
     ),
     Extractor(
             name="trained_chara_data",
-            output_path=Path("trained_chara_data.json"),
+            output_path=EXPORTS_DIR / "trained_chara_data.json",
             resolve=_resolve_trained_chara_data,
             extract=_extract_trained_chara_data,
     ),
     Extractor(
             name="card_data",
-            output_path=Path("card_data.json"),
+            output_path=EXPORTS_DIR / "card_data.json",
             resolve=_resolve_card_data,
             extract=_extract_card_data,
     ),
     Extractor(
             name="friend_data",
-            output_path=Path("friend_data.json"),
+            output_path=EXPORTS_DIR / "friend_data.json",
             resolve=_resolve_friend_data,
             extract=_extract_friend_data,
     ),
     Extractor(
             name="trophy_data",
-            output_path=Path("trophy_data.json"),
+            output_path=EXPORTS_DIR / "trophy_data.json",
             resolve=_resolve_trophy_data,
             extract=_extract_trophy_data,
     ),
     Extractor(
             name="team_stadium_replay",
-            output_folder=Path("race_replays"),
+            output_folder=EXPORTS_DIR / "race_replays",
             resolve=_resolve_team_stadium_replay,
             extract=_extract_team_stadium_replay,
             key_fn=_replay_output_key,
@@ -483,7 +535,7 @@ EXTRACTORS: tuple[Extractor[Any, Any, Any], ...] = (
     ),
     Extractor(
             name="race_info_replay",
-            output_folder=Path("race_replays"),
+            output_folder=EXPORTS_DIR / "race_replays",
             resolve=_resolve_race_info_replay,
             extract=_extract_race_info_replay,
             key_fn=_replay_output_key,
@@ -491,7 +543,7 @@ EXTRACTORS: tuple[Extractor[Any, Any, Any], ...] = (
     ),
     Extractor(
             name="idle_single_mode",
-            output_folder=Path("idle_single_mode"),
+            output_folder=EXPORTS_DIR / "idle_single_mode",
             resolve=_resolve_idle_single_mode,
             extract=_extract_idle_single_mode,
             key_fn=_idle_single_mode_key,
@@ -583,11 +635,12 @@ def _refresh_live_singleton_roots(
 
 def _dump_from_singleton_roots(
         roots: ResolvedSingletonRoots,
-        state: Optional[ExtractionRunState] = None) -> float:
-    """Run all extractors from already-resolved singleton roots and return elapsed seconds."""
+        state: Optional[ExtractionRunState] = None,
+        cancel_requested: Optional[Callable[[], bool]] = None) -> ExtractionPassResult:
+    """Run all extractors from already-resolved singleton roots."""
     t_start = time.perf_counter()
-    _run_extractors(EXTRACTORS, ExtractionContext(roots), state)
-    return time.perf_counter() - t_start
+    results = _run_extractors(EXTRACTORS, ExtractionContext(roots), state, cancel_requested)
+    return ExtractionPassResult(time.perf_counter() - t_start, results)
 
 
 def _prepare_memory_pass(mem: MemoryReader) -> None:
@@ -607,7 +660,7 @@ def _run_live_extractor_pass(
         state: ExtractionRunState,
         pass_num: int,
         label: str,
-        log: Callable[..., None]) -> float:
+        log: Callable[..., None]) -> ExtractionPassResult:
     _prepare_memory_pass(mem)
     try:
         if pass_num > 1:
@@ -618,6 +671,86 @@ def _run_live_extractor_pass(
         return _dump_from_singleton_roots(roots, state)
     finally:
         _finish_memory_pass(mem)
+
+
+# ---------------------------------------------------------------------------
+# Reusable dump session (CLI/TUI boundary)
+# ---------------------------------------------------------------------------
+
+class DumpSession:
+    """Own one initialized memory reader and expose extraction passes to frontends."""
+
+    def __init__(
+            self,
+            minidump: Optional[str] = None,
+            metadata_path: Optional[str] = None,
+            cancel_requested: Optional[Callable[[], bool]] = None) -> None:
+        self.minidump = minidump
+        self.metadata_path = metadata_path
+        self.cancel_requested = cancel_requested
+        self.mem: Optional[MemoryReader] = None
+        self.resolver: Optional[Il2CppResolutionManager] = None
+        self.singleton_index: Optional[dict[tuple[int, int], SingletonGenericClassMatch]] = None
+        self.roots: Optional[ResolvedSingletonRoots] = None
+        self.state = ExtractionRunState()
+
+    def __enter__(self) -> DumpSession:
+        self._raise_if_cancelled()
+        setup = setup_memory(self.minidump, self.metadata_path)
+        self.mem = setup.mem
+        self.metadata_path = str(setup.metadata_path)
+        self.mem.__enter__()
+        try:
+            try:
+                self.resolver = build_resolver(self.mem, setup.metadata_path)
+            finally:
+                self.mem.clear_cache()
+                gc.collect()
+
+            self._raise_if_cancelled()
+            _prepare_memory_pass(self.mem)
+            try:
+                logger.info("Scanning %d generic class instantiations...",
+                            self.resolver.meta_reg.genericClassesCount)
+                self.singleton_index = _build_singleton_generic_index(self.resolver.meta_reg)
+                self._raise_if_cancelled()
+                self.roots = _init_singleton_roots()
+                _refresh_singleton_roots(self.resolver, self.singleton_index, self.roots)
+            finally:
+                _finish_memory_pass(self.mem)
+            return self
+        except Exception:
+            self.close()
+            raise
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self.mem is not None:
+            self.mem.close()
+            self.mem = None
+
+    def is_alive(self) -> bool:
+        return self.mem is not None and self.mem.is_alive()
+
+    def _raise_if_cancelled(self) -> None:
+        if self.cancel_requested is not None and self.cancel_requested():
+            raise InterruptedError("Extraction cancelled")
+
+    def run_pass(self) -> ExtractionPassResult:
+        if self.mem is None or self.resolver is None or self.singleton_index is None or self.roots is None:
+            raise RuntimeError("DumpSession is not initialized")
+
+        self._raise_if_cancelled()
+        _prepare_memory_pass(self.mem)
+        try:
+            if not self.minidump:
+                _refresh_live_singleton_roots(self.resolver, self.singleton_index, self.roots)
+            self._raise_if_cancelled()
+            return _dump_from_singleton_roots(self.roots, self.state, self.cancel_requested)
+        finally:
+            _finish_memory_pass(self.mem)
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +767,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--metadata-path", help="global-metadata.dat path; required with --minidump")
     parser.add_argument("--no-update-check", action="store_true",
                         help="Skip the startup GitHub release check")
+    parser.add_argument("--tui", action="store_true",
+                        help="Launch the interactive Textual interface")
     parser.add_argument("--rerun-mode", choices=("once", "prompt", "daemon"),
                         help="Live rerun behavior. Defaults to prompt in live mode and once in minidump mode.")
     parser.add_argument("--poll-interval", type=float, default=2.0,
@@ -649,6 +784,8 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--rerun-mode prompt/daemon requires live process mode")
     if args.poll_interval <= 0:
         parser.error("--poll-interval must be greater than 0")
+    if args.tui and args.validate_only:
+        parser.error("--validate-only cannot be combined with --tui")
     return args
 
 
@@ -670,9 +807,9 @@ def _run_live_reload_loop(
             logger.info("Target process has exited; stopping live reload")
             return
 
-        elapsed = _run_live_extractor_pass(
+        pass_result = _run_live_extractor_pass(
                 mem, resolver, singleton_index, roots, state, pass_num, "Reload", logger.info)
-        logger.info("Reload extractor pass %d completed in %.2fs", pass_num, elapsed)
+        logger.info("Reload extractor pass %d completed in %.2fs", pass_num, pass_result.elapsed_seconds)
 
         try:
             response = input("Press Enter to rescan, type d for daemon mode, or type q then Enter to exit...")
@@ -702,9 +839,9 @@ def _run_live_daemon_loop(
     poll_interval = max(0.1, float(poll_interval))
     logger.info("Daemon mode started; polling every %.2fs", poll_interval)
     while mem.is_alive():
-        elapsed = _run_live_extractor_pass(
+        pass_result = _run_live_extractor_pass(
                 mem, resolver, singleton_index, roots, state, pass_num, "Daemon", logger.debug)
-        logger.debug("Daemon extractor pass %d completed in %.2fs", pass_num, elapsed)
+        logger.debug("Daemon extractor pass %d completed in %.2fs", pass_num, pass_result.elapsed_seconds)
 
         pass_num += 1
         try:
@@ -718,6 +855,25 @@ def _run_live_daemon_loop(
 
 def main() -> None:
     args = _parse_args()
+    if args.tui:
+        try:
+            from tui import run_tui
+        except ImportError as exc:
+            if exc.name == "textual":
+                raise SystemExit(
+                        "Textual is required for --tui. Install dependencies with: pip install -r requirements.txt")
+            raise
+        run_tui(
+                session_factory=DumpSession,
+                minidump=args.minidump,
+                metadata_path=args.metadata_path,
+                rerun_mode=args.rerun_mode,
+                poll_interval=args.poll_interval,
+                verbose=args.verbose,
+                check_updates=not args.no_update_check,
+        )
+        return
+
     configure_logging(args.verbose)
     t_start = time.perf_counter()
 
@@ -756,10 +912,10 @@ def main() -> None:
             else:
                 _prepare_memory_pass(setup.mem)
                 try:
-                    elapsed = _dump_from_singleton_roots(roots)
+                    pass_result = _dump_from_singleton_roots(roots)
                 finally:
                     _finish_memory_pass(setup.mem)
-                logger.info("Extractor pass completed in %.2fs", elapsed)
+                logger.info("Extractor pass completed in %.2fs", pass_result.elapsed_seconds)
         finally:
             logger.info("Total time: %.2fs", time.perf_counter() - t_start)
     if args.minidump and sys.stdin.isatty():
