@@ -30,25 +30,48 @@ app/.venv/Scripts/python app/app.py
 app/.venv/Scripts/python -m app
 ```
 
-## Packaging (Windows + Linux)
+## Packaging (Windows, Linux, macOS)
 
-Portable PyInstaller bundles are built **locally on each OS** — PyInstaller cannot
-cross-compile, so a Windows build must run on Windows and a Linux build on Linux.
+PyInstaller cannot cross-compile, so every OS needs its own build (and its own host).
+Outputs are written per platform, so builds for different OSes coexist.
 
-```powershell
-pip install -r app/requirements-build.txt
-python app/build.py                  # bundle + archive
-python app/build.py --no-archive     # bundle only
-```
+Set up once with `pip install -r app/requirements-build.txt`, then:
 
-Outputs (git-ignored):
+| Target | Build host | Command | Artifact |
+|--------|-----------|---------|----------|
+| Windows | Windows | `python app/build.py` | `app/dist/windows-x86_64/umadump-gui/` + `.zip` |
+| Linux | any host with Docker | `python app/build.py --docker` | `app/dist/linux-x86_64/umadump-gui/` + `.tar.gz` |
+| macOS | a Mac | `python app/build.py` | `app/dist/macos-<arch>/umadump-gui.app` + `.zip` |
 
-| Path | Contents |
-|------|----------|
-| `app/dist/umadump-gui/` | runnable onedir bundle (`umadump-gui.exe` / `umadump-gui`) |
-| `app/dist/umadump-gui-<ver>-<os>-<arch>.zip` | Windows archive (`.tar.gz` on Linux) |
+ `--no-archive` skips the archive; `--keep-build` keeps PyInstaller's intermediates.
+Rough size: ~112 MB unpacked (Windows) / ~153 MB (Linux), dominated by Qt.
 
-Rough size: ~112 MB unpacked, ~47 MB compressed (dominated by Qt).
+### Linux via Docker
+
+`app/build.py --docker` builds `app/Dockerfile.linux` and runs this same script inside
+it, so a Windows or macOS host can produce the Linux bundle.
+
+The base image is chosen deliberately. PySide6 6.11 ships its x86_64 wheel as
+`manylinux_2_34`, i.e. **Qt itself requires glibc >= 2.34**, so nothing older is
+reachable. `python:3.14-slim-bookworm` (glibc 2.36) would raise the floor to 2.36 and
+lock out Ubuntu 22.04 LTS, and `manylinux_2_34`'s cp314 has no shared libpython, which
+PyInstaller requires. Ubuntu 22.04 (glibc 2.35) plus deadsnakes `python3.14` is the
+lowest base satisfying both, giving a **glibc 2.35 floor**: Ubuntu 22.04+, Debian 12+,
+RHEL 9+. (The aarch64 PySide6 wheel is `manylinux_2_39`, so arm64 needs glibc 2.39.)
+
+### macOS
+
+The spec adds a `BUNDLE` step on Darwin, so macOS produces a real `umadump-gui.app`
+(bundle id `com.umadump.gui`). It is unsigned, so Gatekeeper will object on first open —
+right-click → Open, or `xattr -dr com.apple.quarantine umadump-gui.app`. Build on Apple
+silicon and on Intel separately if you need both architectures.
+
+**Live memory reading is not available on macOS yet.** `memory.py` has no macOS backend
+(it guards on `os.name == "nt"` and otherwise assumes Linux `/proc` +
+`process_vm_readv`), so a Mac build is minidump-only, and the GUI disables the
+"Live process" option there. Reading the game's Wine process on macOS is planned via a
+Frida-backed `MemoryReader` (same approach as `honse-sim`'s career exporter, which
+already drives a Windows `frida-server` inside the Wine prefix).
 
 > **Run the bundle from `app/dist/`, not `app/build/`.** PyInstaller writes a bare
 > bootloader `umadump-gui.exe` into `app/build/umadump-gui/` during the build. It has
@@ -75,8 +98,13 @@ paths, poll interval and checkbox states) is remembered between launches via
 Verify a built bundle without a display:
 
 ```powershell
-QT_QPA_PLATFORM=offscreen UMADUMP_SMOKE_MARKER=smoke.txt ./app/dist/umadump-gui/umadump-gui.exe --smoke-test
-cat smoke.txt   # -> "ok window main:extractors=12 minidump"
+# Windows
+QT_QPA_PLATFORM=offscreen UMADUMP_SMOKE_MARKER=smoke.txt ./app/dist/windows-x86_64/umadump-gui/umadump-gui.exe --smoke-test
+cat smoke.txt   # ok window default_out=<bundle>/umadump-dumps main:extractors=12 minidump
+
+# Linux (host has no Python -- the bundle is self-contained)
+docker run --rm -v "$PWD:/src" -w /src ubuntu:22.04 bash -lc \
+  'QT_QPA_PLATFORM=offscreen ./app/dist/linux-x86_64/umadump-gui/umadump-gui --smoke-test'
 ```
 
 ### Platform support
@@ -85,12 +113,7 @@ cat smoke.txt   # -> "ok window main:extractors=12 minidump"
 |----|--------------|----------|--------|
 | Windows | yes | yes | yes |
 | Linux | yes (game under Wine/Proton) | yes | yes |
-| macOS | no | not packaged | no |
-
-macOS is intentionally excluded: `memory.py` has no macOS backend (it guards on
-`os.name == "nt"` and otherwise assumes Linux `/proc` + `process_vm_readv`), and its
-`_LibCAPI` constructor loads `libc.so.6` at import time, which does not exist on macOS.
-`app/build.py` refuses to build there with an explanatory error.
+| macOS | no (Frida backend planned) | yes | yes |
 
 ## Layout
 
@@ -102,5 +125,6 @@ macOS is intentionally excluded: `memory.py` has no macOS backend (it guards on
 | `log_bridge.py` | `logging.Handler` → Qt signal bridge for live logs |
 | `umadump-gui.spec` | PyInstaller spec (onedir, Qt add-ons excluded) |
 | `build.py` | Cross-platform local build + archive script |
+| `Dockerfile.linux` | Ubuntu 22.04 + deadsnakes builder for `--docker` (glibc 2.35 floor) |
 | `requirements.txt` | Runtime deps (PySide6, minidump) |
 | `requirements-build.txt` | Runtime deps + PyInstaller |

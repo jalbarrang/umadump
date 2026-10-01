@@ -10,6 +10,7 @@ or directly::
     python -m PyInstaller --noconfirm --clean app/umadump-gui.spec
 """
 from pathlib import Path
+import sys
 
 # SPECPATH is the directory containing this spec file (app/).
 ROOT = Path(SPECPATH).resolve().parent
@@ -75,3 +76,17 @@ coll = COLLECT(
     upx=False,
     name=NAME,
 )
+
+# On macOS PyInstaller additionally wraps the collected files into a .app bundle.
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name=f"{NAME}.app",
+        icon=None,
+        bundle_identifier="com.umadump.gui",
+        info_plist={
+            "NSHighResolutionCapable": True,
+            "LSMinimumSystemVersion": "11.0",
+            "NSRequiresAquaSystemAppearance": False,
+        },
+    )

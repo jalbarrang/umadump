@@ -1,0 +1,62 @@
+# Builds the Linux bundle in a container, so a Windows or macOS host can produce
+# it without a Linux machine. Used by: python app/build.py --docker
+#
+# Base choice is deliberate:
+#   * PySide6 6.11 ships its x86_64 wheel as manylinux_2_34, i.e. Qt itself
+#     requires glibc >= 2.34. Nothing older is reachable with these wheels.
+#   * python:3.14-slim-bookworm (glibc 2.36) would push the floor to 2.36 and
+#     lock out Ubuntu 22.04 LTS (glibc 2.35).
+#   * manylinux_2_34 has glibc 2.34 but its cp314 is built without a shared
+#     libpython, which PyInstaller requires.
+#   * Ubuntu 22.04 (glibc 2.35) + deadsnakes python3.14 is the lowest base that
+#     satisfies both constraints, so the produced binary runs on Ubuntu 22.04+
+#     (and Debian 12+, Fedora, RHEL 9+).
+# Note: the aarch64 PySide6 wheel is manylinux_2_39, so arm64 builds need glibc 2.39.
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_ROOT_USER_ACTION=ignore \
+    PYTHONDONTWRITEBYTECODE=1
+
+# binutils/patchelf/file: PyInstaller ELF dependency analysis.
+# Qt import/runtime libs: PyInstaller's PySide6 hook imports QtWidgets, which
+# links libxkbcommon, and QtNetwork links libgssapi_krb5; GL/EGL/fontconfig/
+# freetype/dbus let the bundle also be smoke-tested headlessly.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      software-properties-common \
+      ca-certificates \
+      gnupg \
+      dirmngr \
+ && add-apt-repository -y ppa:deadsnakes/ppa \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3.14 \
+      python3.14-dev \
+      python3.14-venv \
+      binutils \
+      patchelf \
+      file \
+      libxkbcommon0 \
+      libgssapi-krb5-2 \
+      libgl1 \
+      libegl1 \
+      libfontconfig1 \
+      libfreetype6 \
+      libglib2.0-0 \
+      libdbus-1-3 \
+ && rm -rf /var/lib/apt/lists/*
+
+# A venv avoids Ubuntu's externally-managed marker for the system interpreter.
+RUN python3.14 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}" \
+    VIRTUAL_ENV=/opt/venv
+
+WORKDIR /src
+
+# requirements-build.txt references requirements.txt, so both must sit together.
+COPY app/requirements.txt app/requirements-build.txt /tmp/
+RUN python -m pip install --upgrade pip \
+ && python -m pip install -r /tmp/requirements-build.txt

@@ -23,7 +23,7 @@ class QtLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             self._emitter.message.emit(self.format(record), record.levelno)
-        except Exception:  # pragma: no cover - never let logging blow up the worker
+        except Exception:  # noqa: BLE001  # never let logging blow up the worker
             self.handleError(record)
 
 

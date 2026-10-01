@@ -4,21 +4,36 @@ from __future__ import annotations
 import html
 import logging
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Optional
+from typing import cast
 
-from PySide6.QtCore import QSettings, Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QFont
-from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
-                               QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPlainTextEdit, QPushButton,
-                               QRadioButton, QVBoxLayout, QWidget)
-
-from logger import logger
+from PySide6.QtCore import QSettings, QUrl
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QFont
+from PySide6.QtWidgets import (
+    QButtonGroup,
+    QCheckBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QPlainTextEdit,
+    QPushButton,
+    QRadioButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 from app.log_bridge import LogEmitter
 from app.runner import ExtractionWorker
+from logger import logger
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+IS_MACOS = sys.platform == "darwin"
 
 
 def _default_output_dir() -> Path:
@@ -46,7 +61,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("umadump — extractor console")
         self.resize(980, 720)
-        self._worker: Optional[ExtractionWorker] = None
+        self._worker: ExtractionWorker | None = None
         self._settings = QSettings("umadump", "umadump-gui")
         self._default_output_dir = _default_output_dir()
 
@@ -82,6 +97,10 @@ class MainWindow(QMainWindow):
         self._mode_group.addButton(self.live_radio)
         self._mode_group.addButton(self.minidump_radio)
         self.live_radio.toggled.connect(self._apply_mode_state)
+        if IS_MACOS:
+            # memory.py has no live-process backend on macOS; only minidump analysis works.
+            self.live_radio.setToolTip("Live memory reading is unavailable on macOS — use a minidump.")
+            self.minidump_radio.setChecked(True)
         mode_row.addWidget(self.live_radio)
         mode_row.addWidget(self.minidump_radio)
         mode_row.addStretch(1)
@@ -89,7 +108,8 @@ class MainWindow(QMainWindow):
 
         self.minidump_edit = QLineEdit()
         self.minidump_edit.setPlaceholderText("Path to a full-memory .dmp file")
-        form.addRow("Minidump", self._browse_row(self.minidump_edit, self._pick_minidump))
+        self.minidump_row = self._browse_row(self.minidump_edit, self._pick_minidump)
+        form.addRow("Minidump", self.minidump_row)
 
         self.metadata_edit = QLineEdit()
         self.metadata_edit.setPlaceholderText("Auto-derived from the game exe in live mode; required for a minidump")
@@ -142,24 +162,25 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(box)
         layout.setContentsMargins(6, 6, 6, 6)
 
-        header = QHBoxLayout()
-        header.addStretch(1)
-        clear_button = QPushButton("Clear")
-        clear_button.clicked.connect(lambda: self.log_view.clear())
-        header.addWidget(clear_button)
-        layout.addLayout(header)
-
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(5000)
         self.log_view.setFont(QFont("Consolas", 9))
         self.log_view.setStyleSheet("QPlainTextEdit { background:#1e1e1e; color:#d8d8d8; border:1px solid #3a3a3a; }")
+
+        header = QHBoxLayout()
+        header.addStretch(1)
+        clear_button = QPushButton("Clear")
+        clear_button.clicked.connect(self.log_view.clear)
+        header.addWidget(clear_button)
+        layout.addLayout(header)
+
         layout.addWidget(self.log_view)
 
         emitter.message.connect(self._append_log)
         return box
 
-    def _browse_row(self, edit: QLineEdit, slot) -> QWidget:
+    def _browse_row(self, edit: QLineEdit, slot: Callable[[], None]) -> QWidget:
         wrapper = QWidget()
         row = QHBoxLayout(wrapper)
         row.setContentsMargins(0, 0, 0, 0)
@@ -193,16 +214,16 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------- settings
     def _load_settings(self) -> None:
         s = self._settings
-        if s.value("mode", "live", type=str) == "minidump":
+        if IS_MACOS or cast(str, s.value("mode", "live", type=str)) == "minidump":
             self.minidump_radio.setChecked(True)
-        self.minidump_edit.setText(s.value("minidump", "", type=str))
-        self.metadata_edit.setText(s.value("metadata", "", type=str))
-        saved_output = s.value("output_dir", "", type=str)
+        self.minidump_edit.setText(cast(str, s.value("minidump", "", type=str)))
+        self.metadata_edit.setText(cast(str, s.value("metadata", "", type=str)))
+        saved_output = cast(str, s.value("output_dir", "", type=str))
         if saved_output:
             self.output_edit.setText(saved_output)
-        self.poll_spin.setValue(s.value("poll_interval", 2.0, type=float))
-        self.verbose_check.setChecked(s.value("verbose", False, type=bool))
-        self.update_check.setChecked(s.value("update_check", True, type=bool))
+        self.poll_spin.setValue(cast(float, s.value("poll_interval", 2.0, type=float)))
+        self.verbose_check.setChecked(cast(bool, s.value("verbose", False, type=bool)))
+        self.update_check.setChecked(cast(bool, s.value("update_check", True, type=bool)))
         self._apply_mode_state()
 
     def _save_settings(self) -> None:
@@ -216,7 +237,7 @@ class MainWindow(QMainWindow):
         s.setValue("update_check", self.update_check.isChecked())
 
     # -------------------------------------------------------------- cleanup
-    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+    def closeEvent(self, event: QCloseEvent) -> None:
         self._save_settings()
         if self._worker is not None:
             self._worker.request_stop()
@@ -225,7 +246,8 @@ class MainWindow(QMainWindow):
 
     def _apply_mode_state(self) -> None:
         live = self.live_radio.isChecked()
-        self.minidump_edit.parentWidget().setEnabled(not live)
+        self.live_radio.setEnabled(not IS_MACOS)
+        self.minidump_row.setEnabled(not live)
         # Daemon mode only makes sense against a live process.
         self.daemon_button.setEnabled(live)
         if not live and self._worker and self._worker.mode == "daemon":
@@ -287,8 +309,8 @@ class MainWindow(QMainWindow):
         self._worker = None
         self._set_running(False, None)
 
-    def _set_running(self, running: bool, mode: Optional[str]) -> None:
-        for widget in (self.live_radio, self.minidump_radio, self.minidump_edit, self.metadata_edit,
+    def _set_running(self, running: bool, mode: str | None) -> None:
+        for widget in (self.live_radio, self.minidump_radio, self.minidump_row, self.metadata_edit,
                        self.output_edit, self.validate_button, self.once_button, self.poll_spin,
                        self.verbose_check, self.update_check):
             widget.setEnabled(not running)

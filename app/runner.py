@@ -4,19 +4,17 @@ from __future__ import annotations
 import gc
 import os
 import threading
-import time
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
 from PySide6.QtCore import QThread, Signal
-
-from il2cpp_runtime import build_resolver, setup_memory
-from logger import logger
-from update_check import CURRENT_VERSION, notify_if_update_available
 
 # The orchestration helpers still live in main.py; reuse them so the GUI and the
 # CLI stay on exactly the same code path instead of duplicating the pipeline.
 import main as umadump_main
+from il2cpp_runtime import build_resolver, setup_memory
+from logger import logger
+from update_check import CURRENT_VERSION, notify_if_update_available
 
 
 class ExtractionWorker(QThread):
@@ -30,9 +28,9 @@ class ExtractionWorker(QThread):
         self,
         *,
         mode: str,
-        minidump: Optional[str] = None,
-        metadata_path: Optional[str] = None,
-        output_dir: Optional[str] = None,
+        minidump: str | None = None,
+        metadata_path: str | None = None,
+        output_dir: str | None = None,
         poll_interval: float = 2.0,
         verbose: bool = False,
         update_check: bool = True,
@@ -54,7 +52,7 @@ class ExtractionWorker(QThread):
         self._stop.set()
 
     # -- QThread entry -----------------------------------------------------
-    def run(self) -> None:  # noqa: C901 - linear pipeline, kept readable on purpose
+    def run(self) -> None:
         previous_cwd = Path.cwd()
         try:
             if self.output_dir:
@@ -116,7 +114,7 @@ class ExtractionWorker(QThread):
                 pass
 
     # -- daemon loop -------------------------------------------------------
-    def _run_daemon(self, setup, resolver, singleton_index, roots) -> None:
+    def _run_daemon(self, setup: Any, resolver: Any, singleton_index: Any, roots: Any) -> None:
         if self.minidump:
             raise RuntimeError("Daemon mode requires a live process, not a minidump")
 

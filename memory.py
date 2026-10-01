@@ -8,12 +8,15 @@ Contains:
   - WindowsProcessMemory — live process reader via Win32/ntdll
   - LinuxProcessMemory — live process reader via /proc and process_vm_readv
   - MinidumpMemory — offline reader backed by a full-memory minidump
+
+There is no live-process backend for macOS; only ``MinidumpMemory`` works there.
 """
 from __future__ import annotations
 
 import os
 import re
 import struct
+import sys
 from bisect import bisect_right
 from contextlib import contextmanager
 from ctypes import (Array, POINTER as _POINTER, byref as _byref, c_char, c_int, c_long, c_size_t, c_ssize_t, c_ulong,
@@ -33,6 +36,11 @@ if TYPE_CHECKING:
 TARGET_PROCESS = "UmamusumePrettyDerby.exe"
 TARGET_MODULE = "GameAssembly.dll"
 POINTER_SIZE = 8  # x64 only
+
+# Typed as plain bool on purpose: mypy narrows ``sys.platform`` to the host it
+# runs on, so an inline ``sys.platform.startswith(...)`` guard reads as a literal
+# and makes the rest of an ``__init__`` look unreachable when checked on Windows.
+_IS_LINUX: bool = sys.platform.startswith("linux")
 DEFAULT_CACHE_FETCH_WINDOW_SIZE = 1 * 1024 * 1024
 
 
@@ -629,17 +637,31 @@ class _LibCAPI:
 if TYPE_CHECKING:
     _kernel32: _Kernel32Api
     _ntdll: _NtdllApi
-    _libc: _LibCAPI
 
 if os.name == "nt":
     from ctypes import WINFUNCTYPE, WinDLL, get_last_error
 
     _kernel32 = _Kernel32Api()
     _ntdll = _NtdllApi()
+
+    def _get_libc() -> _LibCAPI:
+        raise RuntimeError("process_vm_readv is only available on Linux")
 else:
     from ctypes import CFUNCTYPE, CDLL, get_errno
 
-    _libc = _LibCAPI()
+    _libc: Optional[_LibCAPI] = None
+
+    def _get_libc() -> _LibCAPI:
+        """Load glibc lazily, on first read rather than at import time.
+
+        ``CDLL("libc.so.6")`` does not resolve on hosts without glibc (notably
+        macOS, where the equivalent is ``libSystem.B.dylib``).  Keeping it lazy
+        means this module still imports there, so minidump-only use keeps working.
+        """
+        global _libc
+        if _libc is None:
+            _libc = _LibCAPI()
+        return _libc
 
 
 # ---------------------------------------------------------------------------
@@ -913,6 +935,11 @@ class LinuxProcessMemory(_RegionChunkScanMixin):
     """
 
     def __init__(self, process_name: str = TARGET_PROCESS) -> None:
+        if not _IS_LINUX:
+            raise RuntimeError(
+                f"Live process memory reading is not supported on this platform ({sys.platform}); "
+                "use a minidump instead (--minidump with --metadata-path)."
+            )
         process_name = process_name[:15]
         self._process_name = process_name
         self._pid = self._find_pid_by_name(process_name)
@@ -1019,7 +1046,7 @@ class LinuxProcessMemory(_RegionChunkScanMixin):
         remote_iov.iov_base = c_void_p(address)
         remote_iov.iov_len = c_size_t(size)
 
-        nread = _libc.process_vm_readv(self._pid, byref(local_iov), 1, byref(remote_iov), 1, 0)
+        nread = _get_libc().process_vm_readv(self._pid, byref(local_iov), 1, byref(remote_iov), 1, 0)
 
         if nread < 0:
             err = get_errno()

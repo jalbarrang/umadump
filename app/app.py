@@ -9,10 +9,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication
 
-from app.log_bridge import LogEmitter, install_qt_logging  # noqa: E402
-from app.window import MainWindow  # noqa: E402
+from app.log_bridge import LogEmitter, install_qt_logging
+from app.window import MainWindow
 
 
 def main() -> int:
