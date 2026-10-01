@@ -35,7 +35,14 @@ app/.venv/Scripts/python -m app
 PyInstaller cannot cross-compile, so every OS needs its own build (and its own host).
 Outputs are written per platform, so builds for different OSes coexist.
 
-Set up once with `pip install -r app/requirements-build.txt`, then:
+Install the build deps for the current OS from `app/requirements-build.txt`. With uv that
+is a single command with no venv bookkeeping:
+
+```bash
+uv run --no-project --python 3.14 --with-requirements app/requirements-build.txt python app/build.py
+```
+
+Or with pip inside an activated venv (`pip install -r app/requirements-build.txt`), then:
 
 | Target | Build host | Command | Artifact |
 |--------|-----------|---------|----------|
@@ -61,10 +68,22 @@ RHEL 9+. (The aarch64 PySide6 wheel is `manylinux_2_39`, so arm64 needs glibc 2.
 
 ### macOS
 
+Build it on the Mac with uv:
+
+```bash
+uv run --no-project --python 3.14 --with-requirements app/requirements-build.txt python app/build.py
+```
+
+uv's managed CPython ships a shared `libpython`, which PyInstaller requires (verified
+`Py_ENABLE_SHARED = 1`), so nothing extra is needed. Equivalently, an explicit venv:
+`uv venv --python 3.14 app/.venv`, `uv pip install --python app/.venv/bin/python -r
+app/requirements-build.txt`, then `app/.venv/bin/python app/build.py`.
+
 The spec adds a `BUNDLE` step on Darwin, so macOS produces a real `umadump-gui.app`
 (bundle id `com.umadump.gui`). It is unsigned, so Gatekeeper will object on first open —
 right-click → Open, or `xattr -dr com.apple.quarantine umadump-gui.app`. Build on Apple
-silicon and on Intel separately if you need both architectures.
+silicon and on Intel separately if you need both architectures (the macOS dependency set
+resolves for both on Python 3.14, including `macholib`).
 
 **Live memory reading is not available on macOS yet.** `memory.py` has no macOS backend
 (it guards on `os.name == "nt"` and otherwise assumes Linux `/proc` +
