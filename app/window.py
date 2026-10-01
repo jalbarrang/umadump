@@ -44,7 +44,14 @@ def _default_output_dir() -> Path:
     Frozen builds therefore default to a sibling folder next to the executable.
     """
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent / "umadump-dumps"
+        exe_dir = Path(sys.executable).resolve().parent
+        # Inside a macOS .app, sys.executable is Foo.app/Contents/MacOS/foo, so step
+        # back out of the bundle: writing dumps inside it would also invalidate its
+        # code signature.
+        if sys.platform == "darwin" and exe_dir.parent.name == "Contents" \
+                and exe_dir.parent.parent.suffix == ".app":
+            exe_dir = exe_dir.parent.parent.parent
+        return exe_dir / "umadump-dumps"
     return PROJECT_ROOT
 
 _LEVEL_COLORS = {
@@ -82,6 +89,9 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self.statusBar().showMessage("Idle")
 
+        # Connected only once every widget _apply_mode_state touches exists; on macOS
+        # the minidump radio is preselected, which would otherwise fire it mid-build.
+        self.live_radio.toggled.connect(self._apply_mode_state)
         self._apply_mode_state()
 
     def _build_source_group(self) -> QGroupBox:
@@ -96,11 +106,9 @@ class MainWindow(QMainWindow):
         self._mode_group = QButtonGroup(self)
         self._mode_group.addButton(self.live_radio)
         self._mode_group.addButton(self.minidump_radio)
-        self.live_radio.toggled.connect(self._apply_mode_state)
         if IS_MACOS:
             # memory.py has no live-process backend on macOS; only minidump analysis works.
             self.live_radio.setToolTip("Live memory reading is unavailable on macOS — use a minidump.")
-            self.minidump_radio.setChecked(True)
         mode_row.addWidget(self.live_radio)
         mode_row.addWidget(self.minidump_radio)
         mode_row.addStretch(1)

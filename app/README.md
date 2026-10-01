@@ -80,10 +80,16 @@ uv's managed CPython ships a shared `libpython`, which PyInstaller requires (ver
 app/requirements-build.txt`, then `app/.venv/bin/python app/build.py`.
 
 The spec adds a `BUNDLE` step on Darwin, so macOS produces a real `umadump-gui.app`
-(bundle id `com.umadump.gui`). It is unsigned, so Gatekeeper will object on first open —
-right-click → Open, or `xattr -dr com.apple.quarantine umadump-gui.app`. Build on Apple
-silicon and on Intel separately if you need both architectures (the macOS dependency set
-resolves for both on Python 3.14, including `macholib`).
+(bundle id `com.umadump.gui`), ad-hoc signed by PyInstaller. That still is not a
+Developer ID signature, so a downloaded copy is quarantined by Gatekeeper — right-click →
+Open, or `xattr -dr com.apple.quarantine umadump-gui.app`. Build on Apple silicon and on
+Intel separately if you need both architectures (the macOS dependency set resolves for
+both on Python 3.14, including `macholib`).
+
+Verified on macOS 26.6.2 / arm64 with Homebrew Python 3.14.7: bundle 98 MB, archive
+36 MB, and the smoke test passes headlessly (`exit=0`). Note the default output folder
+for a `.app` is the directory *containing* the bundle, never `Contents/MacOS` — writing
+inside the bundle would break its signature.
 
 **Live memory reading is not available on macOS yet.** `memory.py` has no macOS backend
 (it guards on `os.name == "nt"` and otherwise assumes Linux `/proc` +
