@@ -30,7 +30,7 @@ app/.venv/Scripts/python app/app.py
 app/.venv/Scripts/python -m app
 ```
 
-## Packaging (Windows, Linux, macOS)
+## Packaging (Windows, Linux)
 
 PyInstaller cannot cross-compile, so every OS needs its own build (and its own host).
 Outputs are written per platform, so builds for different OSes coexist.
@@ -48,55 +48,70 @@ Or with pip inside an activated venv (`pip install -r app/requirements-build.txt
 |--------|-----------|---------|----------|
 | Windows | Windows | `python app/build.py` | `app/dist/windows-x86_64/umadump-gui/` + `.zip` |
 | Linux | any host with Docker | `python app/build.py --docker` | `app/dist/linux-x86_64/umadump-gui/` + `.tar.gz` |
-| macOS | a Mac | `python app/build.py` | `app/dist/macos-<arch>/umadump-gui.app` + `.zip` |
 
  `--no-archive` skips the archive; `--keep-build` keeps PyInstaller's intermediates.
 Rough size: ~112 MB unpacked (Windows) / ~153 MB (Linux), dominated by Qt.
+
+There is no macOS build. Mac users run the **Windows** bundle inside the Wine bottle
+that already hosts the game — see below.
 
 ### Linux via Docker
 
 `app/build.py --docker` builds `app/Dockerfile.linux` and runs this same script inside
 it, so a Windows or macOS host can produce the Linux bundle.
 
-The base image is chosen deliberately. PySide6 6.11 ships its x86_64 wheel as
-`manylinux_2_34`, i.e. **Qt itself requires glibc >= 2.34**, so nothing older is
-reachable. `python:3.14-slim-bookworm` (glibc 2.36) would raise the floor to 2.36 and
-lock out Ubuntu 22.04 LTS, and `manylinux_2_34`'s cp314 has no shared libpython, which
-PyInstaller requires. Ubuntu 22.04 (glibc 2.35) plus deadsnakes `python3.14` is the
-lowest base satisfying both, giving a **glibc 2.35 floor**: Ubuntu 22.04+, Debian 12+,
-RHEL 9+. (The aarch64 PySide6 wheel is `manylinux_2_39`, so arm64 needs glibc 2.39.)
+The base image is pinned by the Python 3.14 requirement rather than by Qt. PyInstaller
+needs a shared `libpython`, and Ubuntu 22.04 (glibc 2.35) plus deadsnakes `python3.14`
+is the lowest base that provides one, giving a **glibc 2.35 floor**: Ubuntu 22.04+,
+Debian 12+, RHEL 9+.
 
-### macOS
+The `PySide6<6.10` pin relaxed the Qt side: 6.8.3 ships its x86_64 wheel as
+`manylinux_2_28` (6.11 shipped `manylinux_2_34`), so Qt no longer sets the floor.
+Lowering it further means finding a 3.14 with a shared libpython on an older distro,
+which is untested — leave the image alone until someone verifies that. (The aarch64
+PySide6 wheel is `manylinux_2_39`, so arm64 needs glibc 2.39.)
 
-Build it on the Mac with uv:
+### macOS: run the Windows build in the bottle
+
+Mac users do not get a native build. The game already runs inside a Wine bottle
+(Highball, CrossOver, Whisky), so the **Windows** bundle runs there too and reads the
+game with the same `WindowsProcessMemory` backend it uses on Windows — no extra
+backend, no helper process, no special privileges.
+
+Host-side reading is not an option on Apple silicon, which is why this is the route:
+
+- `task_for_pid` is refused for the Rosetta-translated Wine process, so a Mach backend
+  — and Frida's own macOS attach, which needs the same task port — cannot reach it.
+  Unlocking that means disabling SIP or enabling developer mode.
+- Frida's macOS agent is **arm64-only**, so it cannot load into the x86_64 guest even
+  if the task port were granted.
+
+Unpack the Windows bundle into the bottle and run it with the engine that owns the
+bottle (Highball shown; CrossOver and Whisky have the same shape):
 
 ```bash
-uv run --no-project --python 3.14 --with-requirements app/requirements-build.txt python app/build.py
+WINEPREFIX="$HOME/Library/Application Support/Highball/bottles/Games" \
+  "<engine>/bin/wine" 'C:\path\to\umadump-gui\umadump-gui.exe'
 ```
 
-uv's managed CPython ships a shared `libpython`, which PyInstaller requires (verified
-`Py_ENABLE_SHARED = 1`), so nothing extra is needed. Equivalently, an explicit venv:
-`uv venv --python 3.14 app/.venv`, `uv pip install --python app/.venv/bin/python -r
-app/requirements-build.txt`, then `app/.venv/bin/python app/build.py`.
+Or add it as a shortcut in the bottle's UI (a Highball pin, CrossOver's Run Command).
+Output JSON lands on Windows paths inside the bottle — `.../drive_c/umadump-dumps/`,
+i.e. `~/Library/Application Support/Highball/bottles/Games/drive_c/umadump-dumps/`
+from the Mac side.
 
-The spec adds a `BUNDLE` step on Darwin, so macOS produces a real `umadump-gui.app`
-(bundle id `com.umadump.gui`), ad-hoc signed by PyInstaller. That still is not a
-Developer ID signature, so a downloaded copy is quarantined by Gatekeeper — right-click →
-Open, or `xattr -dr com.apple.quarantine umadump-gui.app`. Build on Apple silicon and on
-Intel separately if you need both architectures (the macOS dependency set resolves for
-both on Python 3.14, including `macholib`).
+**Qt must be < 6.10 or the app will not start.** Qt 6.10+ links `Qt6Core.dll` against
+the OS-provided ICU DLLs (`icuuc.dll`, `icu.dll`). Windows ships those; Wine and
+CrossOver do not, so a 6.10+ build dies at import with:
 
-Verified on macOS 26.6.2 / arm64 with Homebrew Python 3.14.7: bundle 98 MB, archive
-36 MB, and the smoke test passes headlessly (`exit=0`). Note the default output folder
-for a `.app` is the directory *containing* the bundle, never `Contents/MacOS` — writing
-inside the bundle would break its signature.
+```
+err:module:import_dll Library icuuc.dll (which is needed by Qt6Core.dll) not found
+```
 
-**Live memory reading is not available on macOS yet.** `memory.py` has no macOS backend
-(it guards on `os.name == "nt"` and otherwise assumes Linux `/proc` +
-`process_vm_readv`), so a Mac build is minidump-only, and the GUI disables the
-"Live process" option there. Reading the game's Wine process on macOS is planned via a
-Frida-backed `MemoryReader` (same approach as `honse-sim`'s career exporter, which
-already drives a Windows `frida-server` inside the Wine prefix).
+`app/requirements.txt` pins `PySide6>=6.8,<6.10` for exactly this reason. Verified on
+macOS 26.6.2 / arm64 under Highball (CrossOver 26.3 engine): PySide6 6.11.2 fails to
+import QtCore, while PySide6 6.8.3 renders a real window (`platformName: windows`, text
+and colours rasterised correctly). Rebuild the Windows bundle with the pin before
+handing it to Mac users.
 
 > **Run the bundle from `app/dist/`, not `app/build/`.** PyInstaller writes a bare
 > bootloader `umadump-gui.exe` into `app/build/umadump-gui/` during the build. It has
@@ -138,7 +153,7 @@ docker run --rm -v "$PWD:/src" -w /src ubuntu:22.04 bash -lc \
 |----|--------------|----------|--------|
 | Windows | yes | yes | yes |
 | Linux | yes (game under Wine/Proton) | yes | yes |
-| macOS | no (Frida backend planned) | yes | yes |
+| macOS | via the Windows build in the bottle | via the Windows build | no (use the Windows bundle) |
 
 ## Layout
 
@@ -149,7 +164,7 @@ docker run --rm -v "$PWD:/src" -w /src ubuntu:22.04 bash -lc \
 | `runner.py` | `ExtractionWorker` (`QThread`) driving the existing pipeline |
 | `log_bridge.py` | `logging.Handler` → Qt signal bridge for live logs |
 | `umadump-gui.spec` | PyInstaller spec (onedir, Qt add-ons excluded) |
-| `build.py` | Cross-platform local build + archive script |
+| `build.py` | Local build + archive script (Windows, Linux) |
 | `Dockerfile.linux` | Ubuntu 22.04 + deadsnakes builder for `--docker` (glibc 2.35 floor) |
 | `requirements.txt` | Runtime deps (PySide6, minidump) |
 | `requirements-build.txt` | Runtime deps + PyInstaller |

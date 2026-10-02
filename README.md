@@ -159,6 +159,10 @@ python main.py --minidump "D:\path\to\dump.dmp" --validate-only
 python main.py --no-update-check
 ```
 
+On macOS, run the **Windows** build inside the Wine bottle that hosts the game; it reads
+memory with the same backend it uses on Windows, so there is no macOS-specific backend.
+See [`app/README.md`](app/README.md) for the setup and the Qt version constraint.
+
 ---
 
 ## Versioning & update notifications

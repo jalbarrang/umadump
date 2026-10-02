@@ -5,14 +5,15 @@ PyInstaller cannot cross-compile, so each target OS needs its own build:
 
   * Windows  — run this script on Windows (native).
   * Linux    — run this script on Linux, or from any host via ``--docker``.
-  * macOS    — run this script on a Mac (produces ``umadump-gui.app``).
 
 Outputs land under ``app/dist/<platform-tag>/`` so builds for different OSes
 coexist (they are not wiped by each other):
 
   * ``app/dist/<tag>/umadump-gui/``          — runnable onedir bundle
-  * ``app/dist/<tag>/umadump-gui.app``       — macOS app bundle
   * ``app/dist/<tag>/umadump-gui-<ver>-<tag>.zip|.tar.gz`` — archive
+
+macOS is not a build target. Mac users run the Windows bundle inside the Wine
+bottle that already hosts the game (see ``app/README.md``).
 
 Usage::
 
@@ -52,7 +53,7 @@ def project_version() -> str:
 
 
 def platform_tag() -> str:
-    system = {"Windows": "windows", "Linux": "linux", "Darwin": "macos"}.get(
+    system = {"Windows": "windows", "Linux": "linux"}.get(
         platform.system(), platform.system().lower()
     )
     machine = _MACHINE_ALIASES.get(platform.machine().lower(), platform.machine().lower())
@@ -60,12 +61,8 @@ def platform_tag() -> str:
 
 
 def make_archive(bundle: Path, out: Path) -> None:
-    """Archive *bundle* preserving the executable bit (and, on macOS, symlinks)."""
-    if platform.system() == "Darwin" and shutil.which("ditto"):
-        # ditto is the only tool that round-trips .app bundles correctly
-        # (symlinks inside Frameworks/, extended attributes, exec bits).
-        subprocess.run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(bundle), str(out)], check=True)
-    elif platform.system() == "Windows":
+    """Archive *bundle* preserving the executable bit and symlinks."""
+    if platform.system() == "Windows":
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
             for path in sorted(bundle.rglob("*")):
                 if path.is_file():
@@ -77,9 +74,6 @@ def make_archive(bundle: Path, out: Path) -> None:
 
 def find_bundle(platform_dir: Path) -> Path | None:
     """Return the runnable bundle produced in *platform_dir*, if any."""
-    mac_app = platform_dir / f"{NAME}.app"
-    if mac_app.is_dir():
-        return mac_app
     onedir = platform_dir / NAME
     if onedir.is_dir():
         return onedir
@@ -132,6 +126,16 @@ def main() -> int:
                        (("--no-archive", args.no_archive), ("--keep-build", args.keep_build)) if on]
         return run_docker(passthrough)
 
+    if platform.system() == "Darwin":
+        # --docker above is still fine (it builds the Linux bundle in a container).
+        print(
+            "error: macOS is not a build target.\n"
+            "       Mac users run the Windows bundle inside the Wine bottle that hosts\n"
+            "       the game; see app/README.md.",
+            file=sys.stderr,
+        )
+        return 2
+
     try:
         import PyInstaller  # noqa: F401
     except ImportError:
@@ -170,9 +174,7 @@ def main() -> int:
     if bundle is None:
         print(f"error: expected bundle not found under {platform_dir}", file=sys.stderr)
         return 1
-    entry = bundle / "Contents" / "MacOS" / NAME if bundle.suffix == ".app" else bundle / (
-        NAME + (".exe" if platform.system() == "Windows" else "")
-    )
+    entry = bundle / (NAME + (".exe" if platform.system() == "Windows" else ""))
     print(f"bundle:  {bundle}")
     print(f"run me:  {entry}")
 

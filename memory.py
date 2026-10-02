@@ -938,7 +938,8 @@ class LinuxProcessMemory(_RegionChunkScanMixin):
         if not _IS_LINUX:
             raise RuntimeError(
                 f"Live process memory reading is not supported on this platform ({sys.platform}); "
-                "use a minidump instead (--minidump with --metadata-path)."
+                "use a minidump instead (--minidump with --metadata-path). On macOS, run the "
+                "Windows build inside the game's Wine bottle to read a live process."
             )
         process_name = process_name[:15]
         self._process_name = process_name
