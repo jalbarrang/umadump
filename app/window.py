@@ -277,6 +277,7 @@ class MainWindow:
         self.ui_font_path = _first_existing_font(_UI_FONT_CANDIDATES)
         self.mono_font_path = _first_existing_font(_MONO_FONT_CANDIDATES)
         if self.ui_font_path is None and self.mono_font_path is None:
+            logger.warning("No usable font found; falling back to the Dear PyGui default")
             return
         with dpg.font_registry():
             if self.ui_font_path is not None:
@@ -287,6 +288,14 @@ class MainWindow:
                 with dpg.font(self.mono_font_path, _MONO_FONT_SIZE) as mono_font:
                     pass
                 self._mono_font = mono_font
+        # Reported in the log console so it is obvious which files actually loaded.
+        logger.info(
+            "Fonts: ui=%s (%dpx), mono=%s (%dpx)",
+            Path(self.ui_font_path).name if self.ui_font_path else "dearpygui default",
+            _UI_FONT_SIZE,
+            Path(self.mono_font_path).name if self.mono_font_path else "dearpygui default",
+            _MONO_FONT_SIZE,
+        )
 
     # -------------------------------------------------------------- actions
     def _clear_log(self) -> None:
