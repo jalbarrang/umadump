@@ -3,29 +3,31 @@ from __future__ import annotations
 
 import gc
 import os
+import queue
 import threading
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QThread, Signal
-
 # The orchestration helpers still live in main.py; reuse them so the GUI and the
 # CLI stay on exactly the same code path instead of duplicating the pipeline.
 import main as umadump_main
+from app.log_bridge import FailedEvent, FinishedEvent, GuiEvent, StateEvent
 from il2cpp_runtime import build_resolver, setup_memory
 from logger import logger
 from update_check import CURRENT_VERSION, notify_if_update_available
 
 
-class ExtractionWorker(QThread):
-    """Runs one of three jobs off the GUI thread: validate, one pass, or daemon."""
+class ExtractionWorker(threading.Thread):
+    """Runs one of three jobs off the render thread: validate, one pass, or daemon.
 
-    succeeded = Signal(str)  # human-readable summary
-    failed = Signal(str)     # error message
-    state_changed = Signal(str)  # short status text for the status bar
+    Dear PyGui may only be touched from the main thread, so results are pushed
+    onto *events* — the same queue the log handler writes to — and rendered on
+    the next frame.
+    """
 
     def __init__(
         self,
+        events: queue.Queue[GuiEvent],
         *,
         mode: str,
         minidump: str | None = None,
@@ -36,7 +38,8 @@ class ExtractionWorker(QThread):
         update_check: bool = True,
         validate_only: bool = False,
     ) -> None:
-        super().__init__()
+        super().__init__(name="umadump-worker", daemon=True)
+        self._events = events
         self.mode = mode  # "once" | "daemon" | "validate"
         self.minidump = minidump or None
         self.metadata_path = metadata_path or None
@@ -51,7 +54,7 @@ class ExtractionWorker(QThread):
     def request_stop(self) -> None:
         self._stop.set()
 
-    # -- QThread entry -----------------------------------------------------
+    # -- thread entry ------------------------------------------------------
     def run(self) -> None:
         previous_cwd = Path.cwd()
         try:
@@ -64,12 +67,12 @@ class ExtractionWorker(QThread):
             if self.update_check:
                 notify_if_update_available(CURRENT_VERSION)
 
-            self.state_changed.emit("Opening memory backend…")
+            self._events.put(StateEvent("Opening memory backend…"))
             setup = setup_memory(self.minidump, self.metadata_path)
             logger.info("Metadata path: %s", setup.metadata_path)
 
             with setup.mem:
-                self.state_changed.emit("Resolving IL2CPP runtime & validating schemas…")
+                self._events.put(StateEvent("Resolving IL2CPP runtime & validating schemas…"))
                 try:
                     resolver = build_resolver(setup.mem, setup.metadata_path)
                 finally:
@@ -78,10 +81,10 @@ class ExtractionWorker(QThread):
 
                 if self.validate_only:
                     logger.info("Schema validation finished successfully")
-                    self.succeeded.emit("Schema validation passed")
+                    self._events.put(FinishedEvent("Schema validation passed"))
                     return
 
-                self.state_changed.emit("Resolving singletons…")
+                self._events.put(StateEvent("Resolving singletons…"))
                 umadump_main._prepare_memory_pass(setup.mem)
                 try:
                     logger.info(
@@ -98,15 +101,15 @@ class ExtractionWorker(QThread):
                     self._run_daemon(setup, resolver, singleton_index, roots)
                     return
 
-                self.state_changed.emit("Running extractors…")
+                self._events.put(StateEvent("Running extractors…"))
                 elapsed = umadump_main._run_extractor_pass(
                     setup.mem, resolver, singleton_index, roots, umadump_main.ExtractionRunState()
                 )
                 logger.info("Extractor pass completed in %.2fs", elapsed)
-                self.succeeded.emit(f"Extractor pass completed in {elapsed:.2f}s")
+                self._events.put(FinishedEvent(f"Extractor pass completed in {elapsed:.2f}s"))
         except Exception as exc:  # noqa: BLE001 - surface anything to the GUI
             logger.exception("Run failed")
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            self._events.put(FailedEvent(f"{type(exc).__name__}: {exc}"))
         finally:
             try:
                 os.chdir(previous_cwd)
@@ -120,7 +123,7 @@ class ExtractionWorker(QThread):
 
         state = umadump_main.ExtractionRunState()
         logger.info("Daemon mode started; polling every %.2fs", self.poll_interval)
-        self.state_changed.emit("Daemon running — press Stop to finish")
+        self._events.put(StateEvent("Daemon running — press Stop to finish"))
         pass_num = 1
         while not self._stop.is_set() and setup.mem.is_alive():
             elapsed = umadump_main._run_extractor_pass(setup.mem, resolver, singleton_index, roots, state)
@@ -131,7 +134,7 @@ class ExtractionWorker(QThread):
 
         if self._stop.is_set():
             logger.info("Daemon stopped by user after %d pass(es)", pass_num - 1)
-            self.succeeded.emit(f"Daemon stopped after {pass_num - 1} pass(es)")
+            self._events.put(FinishedEvent(f"Daemon stopped after {pass_num - 1} pass(es)"))
         else:
             logger.info("Target process has exited; stopping daemon mode")
-            self.succeeded.emit("Target process exited; daemon stopped")
+            self._events.put(FinishedEvent("Target process exited; daemon stopped"))

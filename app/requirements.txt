@@ -1,5 +1,2 @@
-# Qt 6.10+ links Qt6Core.dll against the OS-provided ICU DLLs (icuuc.dll, icu.dll).
-# Windows ships those; Wine/CrossOver does not, so a 6.10+ Windows build will not
-# start in a bottle. 6.8/6.9 have no ICU dependency and run under Wine.
-PySide6>=6.8,<6.10
+dearpygui>=2.0,<3.0
 minidump~=0.0.24

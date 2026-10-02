@@ -1,39 +1,43 @@
 """Main window: source configuration, run controls, and a live log console."""
 from __future__ import annotations
 
-import html
+import json
 import logging
+import os
+import queue
+import subprocess
 import sys
-from collections.abc import Callable
 from pathlib import Path
-from typing import cast
+from typing import Any, Final
 
-from PySide6.QtCore import QSettings, QUrl
-from PySide6.QtGui import QCloseEvent, QDesktopServices, QFont
-from PySide6.QtWidgets import (
-    QButtonGroup,
-    QCheckBox,
-    QDoubleSpinBox,
-    QFileDialog,
-    QFormLayout,
-    QGroupBox,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QMainWindow,
-    QPlainTextEdit,
-    QPushButton,
-    QRadioButton,
-    QVBoxLayout,
-    QWidget,
-)
+import dearpygui.dearpygui as dpg
 
-from app.log_bridge import LogEmitter
+from app.log_bridge import FailedEvent, FinishedEvent, GuiEvent, LogEvent, StateEvent
 from app.runner import ExtractionWorker
 from logger import logger
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-IS_MACOS = sys.platform == "darwin"
+VIEWPORT_TITLE: Final = "umadump — extractor console"
+
+LIVE_LABEL: Final = "Live process"
+MINIDUMP_LABEL: Final = "Minidump"
+
+# Keep the console bounded; Dear PyGui text items are real widgets, so an
+# unbounded log would grow the item tree without limit.
+MAX_LOG_LINES: Final = 2000
+# Never spend a whole frame draining a backlog: the render loop has to breathe.
+MAX_EVENTS_PER_FRAME: Final = 400
+
+_LEVEL_COLORS: dict[int, tuple[int, int, int, int]] = {
+    logging.DEBUG: (138, 138, 138, 255),
+    logging.INFO: (216, 216, 216, 255),
+    logging.WARNING: (224, 160, 48, 255),
+    logging.ERROR: (224, 92, 92, 255),
+    logging.CRITICAL: (255, 77, 77, 255),
+}
+_DEFAULT_LOG_COLOR: Final = (216, 216, 216, 255)
+
+_OPEN_WITH: Final[dict[str, str]] = {"win32": "explorer", "darwin": "open"}
 
 
 def _default_output_dir() -> Path:
@@ -44,228 +48,193 @@ def _default_output_dir() -> Path:
     Frozen builds therefore default to a sibling folder next to the executable.
     """
     if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).resolve().parent
-        # Inside a macOS .app, sys.executable is Foo.app/Contents/MacOS/foo, so step
-        # back out of the bundle: writing dumps inside it would also invalidate its
-        # code signature.
-        if sys.platform == "darwin" and exe_dir.parent.name == "Contents" \
-                and exe_dir.parent.parent.suffix == ".app":
-            exe_dir = exe_dir.parent.parent.parent
-        return exe_dir / "umadump-dumps"
+        return Path(sys.executable).resolve().parent / "umadump-dumps"
     return PROJECT_ROOT
 
-_LEVEL_COLORS = {
-    logging.DEBUG: "#8a8a8a",
-    logging.INFO: "#d8d8d8",
-    logging.WARNING: "#e0a030",
-    logging.ERROR: "#e05c5c",
-    logging.CRITICAL: "#ff4d4d",
-}
+
+def _settings_path() -> Path:
+    """Per-user settings file, alongside the other umadump config."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return base / "umadump" / "umadump-gui.json"
 
 
-class MainWindow(QMainWindow):
-    def __init__(self, emitter: LogEmitter) -> None:
-        super().__init__()
-        self.setWindowTitle("umadump — extractor console")
-        self.resize(980, 720)
+def _picked_path(app_data: object) -> str:
+    """Pull the chosen path out of a file-dialog payload."""
+    if isinstance(app_data, dict):
+        picked = app_data.get("file_path_name") or app_data.get("current_path")
+        return str(picked or "")
+    return str(app_data or "")
+
+
+class MainWindow:
+    """Builds the Dear PyGui item tree and owns the worker lifecycle."""
+
+    ROOT: Final = "root_window"
+    SOURCE_TABLE: Final = "source_table"
+    MODE: Final = "mode_radio"
+    MINIDUMP: Final = "minidump_input"
+    BTN_MINIDUMP: Final = "minidump_browse"
+    METADATA: Final = "metadata_input"
+    BTN_METADATA: Final = "metadata_browse"
+    OUTPUT: Final = "output_input"
+    BTN_OUTPUT: Final = "output_browse"
+    BTN_VALIDATE: Final = "btn_validate"
+    BTN_ONCE: Final = "btn_once"
+    BTN_DAEMON: Final = "btn_daemon"
+    POLL: Final = "poll_input"
+    VERBOSE: Final = "verbose_check"
+    UPDATE_CHECK: Final = "update_check"
+    BTN_OPEN_OUTPUT: Final = "btn_open_output"
+    LOG: Final = "log_child"
+    STATUS: Final = "status_text"
+    DLG_MINIDUMP: Final = "dlg_minidump"
+    DLG_METADATA: Final = "dlg_metadata"
+    DLG_OUTPUT: Final = "dlg_output"
+
+    def __init__(self, events: queue.Queue[GuiEvent]) -> None:
+        self._events = events
         self._worker: ExtractionWorker | None = None
-        self._settings = QSettings("umadump", "umadump-gui")
         self._default_output_dir = _default_output_dir()
-
-        self._build_ui(emitter)
-        self._load_settings()
+        self.built = False
 
     # ------------------------------------------------------------------ UI
-    def _build_ui(self, emitter: LogEmitter) -> None:
-        central = QWidget(self)
-        root_layout = QVBoxLayout(central)
-        root_layout.setContentsMargins(12, 12, 12, 12)
-        root_layout.setSpacing(10)
+    def build(self) -> None:
+        """Create every item. Safe without a viewport, which keeps the smoke test headless."""
+        with dpg.window(tag=self.ROOT):
+            self._build_source()
+            self._build_run()
+            self._build_log()
+            dpg.add_separator()
+            dpg.add_text("Idle", tag=self.STATUS, color=_DEFAULT_LOG_COLOR)
 
-        root_layout.addWidget(self._build_source_group())
-        root_layout.addWidget(self._build_run_group())
-        root_layout.addWidget(self._build_log_group(emitter), stretch=1)
+        self._build_file_dialogs()
+        self._load_settings()
+        self.built = True
 
-        self.setCentralWidget(central)
-        self.statusBar().showMessage("Idle")
+    def _build_source(self) -> None:
+        dpg.add_text("Source")
+        dpg.add_separator()
+        with dpg.table(header_row=False, width=-1, policy=dpg.mvTable_SizingStretchProp,
+                       tag=self.SOURCE_TABLE):
+            dpg.add_table_column(init_width_or_weight=160, width_fixed=True)
+            dpg.add_table_column(init_width_or_weight=1.0)
 
-        # Connected only once every widget _apply_mode_state touches exists; on macOS
-        # the minidump radio is preselected, which would otherwise fire it mid-build.
-        self.live_radio.toggled.connect(self._apply_mode_state)
-        self._apply_mode_state()
+            with dpg.table_row():
+                dpg.add_text("Mode")
+                dpg.add_radio_button((LIVE_LABEL, MINIDUMP_LABEL), default_value=LIVE_LABEL,
+                                     horizontal=True, tag=self.MODE, callback=self._on_mode_changed)
 
-    def _build_source_group(self) -> QGroupBox:
-        box = QGroupBox("Source")
-        form = QFormLayout(box)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+            with dpg.table_row():
+                dpg.add_text("Minidump")
+                with dpg.group(horizontal=True):
+                    dpg.add_input_text(tag=self.MINIDUMP, width=-110,
+                                       hint="Path to a full-memory .dmp file")
+                    dpg.add_button(label="Browse…", tag=self.BTN_MINIDUMP,
+                                   callback=lambda: dpg.show_item(self.DLG_MINIDUMP))
 
-        mode_row = QHBoxLayout()
-        self.live_radio = QRadioButton("Live process")
-        self.minidump_radio = QRadioButton("Minidump")
-        self.live_radio.setChecked(True)
-        self._mode_group = QButtonGroup(self)
-        self._mode_group.addButton(self.live_radio)
-        self._mode_group.addButton(self.minidump_radio)
-        if IS_MACOS:
-            # memory.py has no live-process backend on macOS; only minidump analysis works.
-            self.live_radio.setToolTip("Live memory reading is unavailable on macOS — use a minidump.")
-        mode_row.addWidget(self.live_radio)
-        mode_row.addWidget(self.minidump_radio)
-        mode_row.addStretch(1)
-        form.addRow("Mode", mode_row)
+            with dpg.table_row():
+                dpg.add_text("global-metadata.dat")
+                with dpg.group(horizontal=True):
+                    dpg.add_input_text(tag=self.METADATA, width=-110,
+                                       hint="Auto-derived from the game exe in live mode")
+                    dpg.add_button(label="Browse…", tag=self.BTN_METADATA,
+                                   callback=lambda: dpg.show_item(self.DLG_METADATA))
 
-        self.minidump_edit = QLineEdit()
-        self.minidump_edit.setPlaceholderText("Path to a full-memory .dmp file")
-        self.minidump_row = self._browse_row(self.minidump_edit, self._pick_minidump)
-        form.addRow("Minidump", self.minidump_row)
+            with dpg.table_row():
+                dpg.add_text("Output folder")
+                with dpg.group(horizontal=True):
+                    dpg.add_input_text(tag=self.OUTPUT, width=-110)
+                    dpg.add_button(label="Browse…", tag=self.BTN_OUTPUT,
+                                   callback=lambda: dpg.show_item(self.DLG_OUTPUT))
 
-        self.metadata_edit = QLineEdit()
-        self.metadata_edit.setPlaceholderText("Auto-derived from the game exe in live mode; required for a minidump")
-        form.addRow("global-metadata.dat", self._browse_row(self.metadata_edit, self._pick_metadata))
+    def _build_run(self) -> None:
+        dpg.add_spacer(height=6)
+        dpg.add_text("Run")
+        dpg.add_separator()
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Validate schema", tag=self.BTN_VALIDATE,
+                           callback=lambda: self._start("validate"))
+            dpg.add_button(label="Run once", tag=self.BTN_ONCE,
+                           callback=lambda: self._start("once"))
+            dpg.add_button(label="Start daemon", tag=self.BTN_DAEMON,
+                           callback=self._toggle_daemon)
+            dpg.add_spacer(width=18)
+            dpg.add_text("Poll (s)")
+            dpg.add_input_double(tag=self.POLL, default_value=2.0, min_value=0.1, max_value=120.0,
+                                 step=0.5, format="%.1f", width=90)
+            dpg.add_spacer(width=12)
+            dpg.add_checkbox(label="Verbose", tag=self.VERBOSE, default_value=False)
+            dpg.add_checkbox(label="Update check", tag=self.UPDATE_CHECK, default_value=True)
+            dpg.add_spacer(width=12)
+            dpg.add_button(label="Open output folder", tag=self.BTN_OPEN_OUTPUT,
+                           callback=self._open_output_dir)
 
-        self.output_edit = QLineEdit(str(self._default_output_dir))
-        form.addRow("Output folder", self._browse_row(self.output_edit, self._pick_output_dir))
+    def _build_log(self) -> None:
+        dpg.add_spacer(height=6)
+        with dpg.group(horizontal=True):
+            dpg.add_text("Log")
+            dpg.add_spacer(width=12)
+            dpg.add_button(label="Clear", callback=lambda: dpg.delete_item(self.LOG, children_only=True))
+        dpg.add_separator()
+        dpg.add_child_window(tag=self.LOG, height=-1, width=-1, horizontal_scrollbar=True,
+                             border=True)
 
-        return box
-
-    def _build_run_group(self) -> QGroupBox:
-        box = QGroupBox("Run")
-        row = QHBoxLayout(box)
-
-        self.validate_button = QPushButton("Validate schema")
-        self.once_button = QPushButton("Run once")
-        self.daemon_button = QPushButton("Start daemon")
-        self.validate_button.clicked.connect(lambda: self._start("validate"))
-        self.once_button.clicked.connect(lambda: self._start("once"))
-        self.daemon_button.clicked.connect(self._toggle_daemon)
-
-        row.addWidget(self.validate_button)
-        row.addWidget(self.once_button)
-        row.addWidget(self.daemon_button)
-        row.addSpacing(12)
-
-        row.addWidget(QLabel("Poll (s)"))
-        self.poll_spin = QDoubleSpinBox()
-        self.poll_spin.setRange(0.1, 120.0)
-        self.poll_spin.setSingleStep(0.5)
-        self.poll_spin.setValue(2.0)
-        self.poll_spin.setDecimals(1)
-        row.addWidget(self.poll_spin)
-
-        self.verbose_check = QCheckBox("Verbose")
-        self.update_check = QCheckBox("Update check")
-        self.update_check.setChecked(True)
-        row.addWidget(self.verbose_check)
-        row.addWidget(self.update_check)
-        row.addStretch(1)
-
-        self.open_output_button = QPushButton("Open output folder")
-        self.open_output_button.clicked.connect(self._open_output_dir)
-        row.addWidget(self.open_output_button)
-
-        return box
-
-    def _build_log_group(self, emitter: LogEmitter) -> QGroupBox:
-        box = QGroupBox("Log")
-        layout = QVBoxLayout(box)
-        layout.setContentsMargins(6, 6, 6, 6)
-
-        self.log_view = QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setMaximumBlockCount(5000)
-        self.log_view.setFont(QFont("Consolas", 9))
-        self.log_view.setStyleSheet("QPlainTextEdit { background:#1e1e1e; color:#d8d8d8; border:1px solid #3a3a3a; }")
-
-        header = QHBoxLayout()
-        header.addStretch(1)
-        clear_button = QPushButton("Clear")
-        clear_button.clicked.connect(self.log_view.clear)
-        header.addWidget(clear_button)
-        layout.addLayout(header)
-
-        layout.addWidget(self.log_view)
-
-        emitter.message.connect(self._append_log)
-        return box
-
-    def _browse_row(self, edit: QLineEdit, slot: Callable[[], None]) -> QWidget:
-        wrapper = QWidget()
-        row = QHBoxLayout(wrapper)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.addWidget(edit, stretch=1)
-        button = QPushButton("Browse…")
-        button.clicked.connect(slot)
-        row.addWidget(button)
-        return wrapper
+    def _build_file_dialogs(self) -> None:
+        common = {"show": False, "width": 760, "height": 460, "modal": False,
+                  "default_path": str(self._default_output_dir)}
+        with dpg.file_dialog(tag=self.DLG_MINIDUMP, callback=self._on_minidump_picked, **common):
+            dpg.add_file_extension(".dmp")
+            dpg.add_file_extension(".*")
+        with dpg.file_dialog(tag=self.DLG_METADATA, callback=self._on_metadata_picked, **common):
+            dpg.add_file_extension(".dat")
+            dpg.add_file_extension(".*")
+        with dpg.file_dialog(tag=self.DLG_OUTPUT, callback=self._on_output_picked,
+                             directory_selector=True, **common):
+            pass
 
     # -------------------------------------------------------------- actions
-    def _pick_minidump(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Select minidump", self.output_edit.text(),
-                                              "Dump files (*.dmp);;All files (*)")
-        if path:
-            self.minidump_edit.setText(path)
+    def _on_minidump_picked(self, _sender: object, app_data: object, _user: object) -> None:
+        if path := _picked_path(app_data):
+            dpg.set_value(self.MINIDUMP, path)
 
-    def _pick_metadata(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Select global-metadata.dat", self.output_edit.text(),
-                                              "Metadata (*.dat);;All files (*)")
-        if path:
-            self.metadata_edit.setText(path)
+    def _on_metadata_picked(self, _sender: object, app_data: object, _user: object) -> None:
+        if path := _picked_path(app_data):
+            dpg.set_value(self.METADATA, path)
 
-    def _pick_output_dir(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select output folder", self.output_edit.text())
-        if path:
-            self.output_edit.setText(path)
+    def _on_output_picked(self, _sender: object, app_data: object, _user: object) -> None:
+        if path := _picked_path(app_data):
+            dpg.set_value(self.OUTPUT, path)
 
     def _open_output_dir(self) -> None:
-        QDesktopServices.openUrl(QUrl.fromLocalFile(self.output_edit.text() or str(self._default_output_dir)))
+        path = Path(str(dpg.get_value(self.OUTPUT)) or self._default_output_dir)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            subprocess.Popen([_OPEN_WITH.get(sys.platform, "xdg-open"), str(path)])
+        except OSError as exc:
+            logger.warning("Could not open %s: %s", path, exc)
 
-    # -------------------------------------------------------------- settings
-    def _load_settings(self) -> None:
-        s = self._settings
-        if IS_MACOS or cast(str, s.value("mode", "live", type=str)) == "minidump":
-            self.minidump_radio.setChecked(True)
-        self.minidump_edit.setText(cast(str, s.value("minidump", "", type=str)))
-        self.metadata_edit.setText(cast(str, s.value("metadata", "", type=str)))
-        saved_output = cast(str, s.value("output_dir", "", type=str))
-        if saved_output:
-            self.output_edit.setText(saved_output)
-        self.poll_spin.setValue(cast(float, s.value("poll_interval", 2.0, type=float)))
-        self.verbose_check.setChecked(cast(bool, s.value("verbose", False, type=bool)))
-        self.update_check.setChecked(cast(bool, s.value("update_check", True, type=bool)))
+    def _on_mode_changed(self) -> None:
         self._apply_mode_state()
 
-    def _save_settings(self) -> None:
-        s = self._settings
-        s.setValue("mode", "minidump" if self.minidump_radio.isChecked() else "live")
-        s.setValue("minidump", self.minidump_edit.text())
-        s.setValue("metadata", self.metadata_edit.text())
-        s.setValue("output_dir", self.output_edit.text())
-        s.setValue("poll_interval", self.poll_spin.value())
-        s.setValue("verbose", self.verbose_check.isChecked())
-        s.setValue("update_check", self.update_check.isChecked())
-
-    # -------------------------------------------------------------- cleanup
-    def closeEvent(self, event: QCloseEvent) -> None:
-        self._save_settings()
-        if self._worker is not None:
-            self._worker.request_stop()
-            self._worker.wait(5000)
-        super().closeEvent(event)
-
     def _apply_mode_state(self) -> None:
-        live = self.live_radio.isChecked()
-        self.live_radio.setEnabled(not IS_MACOS)
-        self.minidump_row.setEnabled(not live)
+        live = dpg.get_value(self.MODE) == LIVE_LABEL
+        for tag in (self.MINIDUMP, self.BTN_MINIDUMP):
+            dpg.configure_item(tag, enabled=not live)
         # Daemon mode only makes sense against a live process.
-        self.daemon_button.setEnabled(live)
-        if not live and self._worker and self._worker.mode == "daemon":
+        dpg.configure_item(self.BTN_DAEMON, enabled=live)
+        if not live and self._worker is not None and self._worker.mode == "daemon":
             self._worker.request_stop()
 
     def _toggle_daemon(self) -> None:
-        if self._worker and self._worker.mode == "daemon":
+        if self._worker is not None and self._worker.mode == "daemon":
             self._worker.request_stop()
-            self.daemon_button.setText("Stopping…")
-            self.daemon_button.setEnabled(False)
+            dpg.set_item_label(self.BTN_DAEMON, "Stopping…")
+            dpg.configure_item(self.BTN_DAEMON, enabled=False)
         else:
             self._start("daemon")
 
@@ -273,63 +242,125 @@ class MainWindow(QMainWindow):
         if self._worker is not None:
             return
 
-        minidump = self.minidump_edit.text().strip()
-        metadata = self.metadata_edit.text().strip()
-        if not self.live_radio.isChecked():
+        minidump = str(dpg.get_value(self.MINIDUMP)).strip()
+        metadata = str(dpg.get_value(self.METADATA)).strip()
+        if dpg.get_value(self.MODE) != LIVE_LABEL:
             if not minidump:
                 self._append_log("ERROR: Minidump mode needs a .dmp path.", logging.ERROR)
                 return
             if not metadata:
-                self._append_log("ERROR: Minidump mode needs a global-metadata.dat path.", logging.ERROR)
+                self._append_log("ERROR: Minidump mode needs a global-metadata.dat path.",
+                                 logging.ERROR)
                 return
 
-        verbose = self.verbose_check.isChecked()
+        verbose = bool(dpg.get_value(self.VERBOSE))
         logger.setLevel(logging.DEBUG if verbose else logging.INFO)
 
         self._set_running(True, mode)
         worker = ExtractionWorker(
+            self._events,
             mode=mode,
             minidump=minidump,
             metadata_path=metadata or None,
-            output_dir=self.output_edit.text().strip() or str(self._default_output_dir),
-            poll_interval=self.poll_spin.value(),
+            output_dir=str(dpg.get_value(self.OUTPUT)).strip() or str(self._default_output_dir),
+            poll_interval=float(dpg.get_value(self.POLL)),
             verbose=verbose,
-            update_check=self.update_check.isChecked(),
+            update_check=bool(dpg.get_value(self.UPDATE_CHECK)),
             validate_only=(mode == "validate"),
         )
-        worker.state_changed.connect(self.statusBar().showMessage)
-        worker.succeeded.connect(self._on_success)
-        worker.failed.connect(self._on_failure)
-        worker.finished.connect(self._on_finished)
         self._worker = worker
         worker.start()
 
-    # ------------------------------------------------------------- handlers
-    def _on_success(self, summary: str) -> None:
-        self._append_log(summary, logging.INFO)
-        self.statusBar().showMessage(summary)
+    # -------------------------------------------------------------- events
+    def drain(self) -> None:
+        """Render queued worker/log events. Call once per frame, main thread only."""
+        for _ in range(MAX_EVENTS_PER_FRAME):
+            try:
+                event = self._events.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(event, LogEvent):
+                self._append_log(event.text, event.level)
+            elif isinstance(event, StateEvent):
+                dpg.set_value(self.STATUS, event.text)
+            elif isinstance(event, FinishedEvent):
+                self._append_log(event.summary, logging.INFO)
+                dpg.set_value(self.STATUS, event.summary)
+            elif isinstance(event, FailedEvent):
+                self._append_log(event.message, logging.ERROR)
+                dpg.set_value(self.STATUS, "Failed")
 
-    def _on_failure(self, message: str) -> None:
-        self._append_log(message, logging.ERROR)
-        self.statusBar().showMessage("Failed")
+        self._reap_worker()
 
-    def _on_finished(self) -> None:
-        self._worker = None
-        self._set_running(False, None)
-
-    def _set_running(self, running: bool, mode: str | None) -> None:
-        for widget in (self.live_radio, self.minidump_radio, self.minidump_row, self.metadata_edit,
-                       self.output_edit, self.validate_button, self.once_button, self.poll_spin,
-                       self.verbose_check, self.update_check):
-            widget.setEnabled(not running)
-        if running:
-            self.daemon_button.setEnabled(mode == "daemon")
-            self.daemon_button.setText("Stop daemon" if mode == "daemon" else "Start daemon")
-        else:
-            self.daemon_button.setText("Start daemon")
-            self._apply_mode_state()
+    def _reap_worker(self) -> None:
+        worker = self._worker
+        if worker is not None and not worker.is_alive():
+            self._worker = None
+            self._set_running(False, None)
 
     def _append_log(self, text: str, level: int) -> None:
-        color = _LEVEL_COLORS.get(level, "#d8d8d8")
-        safe = html.escape(text).replace("\n", "<br>")
-        self.log_view.appendHtml(f'<span style="color:{color}; white-space:pre-wrap;">{safe}</span>')
+        dpg.add_text(text, parent=self.LOG, color=_LEVEL_COLORS.get(level, _DEFAULT_LOG_COLOR))
+        children = dpg.get_item_children(self.LOG, 1) or []
+        if len(children) > MAX_LOG_LINES:
+            for item in children[: len(children) - MAX_LOG_LINES]:
+                dpg.delete_item(item)
+        dpg.set_y_scroll(self.LOG, dpg.get_y_scroll_max(self.LOG))
+
+    def _set_running(self, running: bool, mode: str | None) -> None:
+        for tag in (self.MODE, self.MINIDUMP, self.BTN_MINIDUMP, self.METADATA, self.BTN_METADATA,
+                    self.OUTPUT, self.BTN_OUTPUT, self.BTN_VALIDATE, self.BTN_ONCE, self.POLL,
+                    self.VERBOSE, self.UPDATE_CHECK):
+            dpg.configure_item(tag, enabled=not running)
+        if running:
+            dpg.configure_item(self.BTN_DAEMON, enabled=mode == "daemon")
+            dpg.set_item_label(self.BTN_DAEMON, "Stop daemon" if mode == "daemon" else "Start daemon")
+        else:
+            dpg.set_item_label(self.BTN_DAEMON, "Start daemon")
+            self._apply_mode_state()
+
+    # -------------------------------------------------------------- settings
+    def _load_settings(self) -> None:
+        data: dict[str, Any] = {}
+        try:
+            loaded = json.loads(_settings_path().read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError):
+            pass  # first run, or a hand-edited file; defaults are fine
+
+        dpg.set_value(self.MODE, MINIDUMP_LABEL if data.get("mode") == "minidump" else LIVE_LABEL)
+        dpg.set_value(self.MINIDUMP, str(data.get("minidump") or ""))
+        dpg.set_value(self.METADATA, str(data.get("metadata") or ""))
+        dpg.set_value(self.OUTPUT, str(data.get("output_dir") or "") or str(self._default_output_dir))
+        poll = data.get("poll_interval")
+        dpg.set_value(self.POLL, float(poll) if isinstance(poll, (int, float)) else 2.0)
+        dpg.set_value(self.VERBOSE, bool(data.get("verbose", False)))
+        dpg.set_value(self.UPDATE_CHECK, bool(data.get("update_check", True)))
+        self._apply_mode_state()
+
+    def _save_settings(self) -> None:
+        path = _settings_path()
+        payload = {
+            "mode": "minidump" if dpg.get_value(self.MODE) == MINIDUMP_LABEL else "live",
+            "minidump": str(dpg.get_value(self.MINIDUMP)),
+            "metadata": str(dpg.get_value(self.METADATA)),
+            "output_dir": str(dpg.get_value(self.OUTPUT)),
+            "poll_interval": float(dpg.get_value(self.POLL)),
+            "verbose": bool(dpg.get_value(self.VERBOSE)),
+            "update_check": bool(dpg.get_value(self.UPDATE_CHECK)),
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Could not save settings to %s: %s", path, exc)
+
+    # -------------------------------------------------------------- cleanup
+    def shutdown(self) -> None:
+        """Persist settings and stop any running worker. Called on viewport close."""
+        self._save_settings()
+        worker = self._worker
+        if worker is not None:
+            worker.request_stop()
+            worker.join(timeout=5.0)
+            self._worker = None

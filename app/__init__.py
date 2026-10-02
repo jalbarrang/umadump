@@ -1,1 +1,1 @@
-"""Qt front-end for the umadump memory extractor."""
+"""Dear PyGui front-end for the umadump memory extractor."""

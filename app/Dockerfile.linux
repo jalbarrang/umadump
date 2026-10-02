@@ -2,16 +2,14 @@
 # it without a Linux machine. Used by: python app/build.py --docker
 #
 # Base choice is deliberate:
-#   * PySide6 6.11 ships its x86_64 wheel as manylinux_2_34, i.e. Qt itself
-#     requires glibc >= 2.34. Nothing older is reachable with these wheels.
-#   * python:3.14-slim-bookworm (glibc 2.36) would push the floor to 2.36 and
-#     lock out Ubuntu 22.04 LTS (glibc 2.35).
-#   * manylinux_2_34 has glibc 2.34 but its cp314 is built without a shared
-#     libpython, which PyInstaller requires.
+#   * PyInstaller needs a Python built with a shared libpython. The manylinux
+#     wheels for 3.14 are built without one, and python:3.14-slim-bookworm
+#     (glibc 2.36) would push the floor to 2.36 and lock out Ubuntu 22.04 LTS.
 #   * Ubuntu 22.04 (glibc 2.35) + deadsnakes python3.14 is the lowest base that
-#     satisfies both constraints, so the produced binary runs on Ubuntu 22.04+
-#     (and Debian 12+, Fedora, RHEL 9+).
-# Note: the aarch64 PySide6 wheel is manylinux_2_39, so arm64 builds need glibc 2.39.
+#     satisfies both, so the produced binary runs on Ubuntu 22.04+ (and
+#     Debian 12+, Fedora, RHEL 9+).
+# No GUI dependency raises the floor: Dear PyGui statically links its SDL2 into
+# _dearpygui.so and is manylinux-compatible.
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -21,9 +19,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1
 
 # binutils/patchelf/file: PyInstaller ELF dependency analysis.
-# Qt import/runtime libs: PyInstaller's PySide6 hook imports QtWidgets, which
-# links libxkbcommon, and QtNetwork links libgssapi_krb5; GL/EGL/fontconfig/
-# freetype/dbus let the bundle also be smoke-tested headlessly.
+# libx11-6: Dear PyGui's _dearpygui.so links it directly (SDL2 is statically
+# linked in), so it must be present for the smoke test to import at all.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       software-properties-common \
@@ -39,14 +36,7 @@ RUN apt-get update \
       binutils \
       patchelf \
       file \
-      libxkbcommon0 \
-      libgssapi-krb5-2 \
-      libgl1 \
-      libegl1 \
-      libfontconfig1 \
-      libfreetype6 \
-      libglib2.0-0 \
-      libdbus-1-3 \
+      libx11-6 \
  && rm -rf /var/lib/apt/lists/*
 
 # A venv avoids Ubuntu's externally-managed marker for the system interpreter.

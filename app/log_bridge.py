@@ -1,38 +1,69 @@
-"""Bridge the ``umadump`` logger into Qt signals so the GUI can show live logs."""
+"""Bridge the ``umadump`` logger into a thread-safe queue the GUI drains.
+
+Dear PyGui is immediate-mode and must be driven from the main thread, so the
+worker thread never touches it. Everything the worker wants to show is pushed
+here as an event and rendered on the next frame.
+"""
 from __future__ import annotations
 
 import logging
-
-from PySide6.QtCore import QObject, Signal
-
-
-class LogEmitter(QObject):
-    """Re-emits log records on the GUI thread via a queued connection."""
-
-    message = Signal(str, int)  # formatted text, logging level number
+import queue
+from dataclasses import dataclass
 
 
-class QtLogHandler(logging.Handler):
-    """A logging handler that forwards formatted records to a :class:`LogEmitter`."""
+@dataclass(frozen=True, slots=True)
+class LogEvent:
+    """One formatted log line plus its ``logging`` level number."""
 
-    def __init__(self, emitter: LogEmitter) -> None:
+    text: str
+    level: int
+
+
+@dataclass(frozen=True, slots=True)
+class StateEvent:
+    """Short status text for the current phase."""
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class FinishedEvent:
+    """A run finished successfully; *summary* is human-readable."""
+
+    summary: str
+
+
+@dataclass(frozen=True, slots=True)
+class FailedEvent:
+    """A run raised; *message* is the formatted exception."""
+
+    message: str
+
+
+GuiEvent = LogEvent | StateEvent | FinishedEvent | FailedEvent
+
+
+class QueueLogHandler(logging.Handler):
+    """Forward formatted records to *events* instead of writing them anywhere."""
+
+    def __init__(self, events: queue.Queue[GuiEvent]) -> None:
         super().__init__()
-        self._emitter = emitter
+        self._events = events
         self.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            self._emitter.message.emit(self.format(record), record.levelno)
-        except Exception:  # noqa: BLE001  # never let logging blow up the worker
+            self._events.put(LogEvent(self.format(record), record.levelno))
+        except Exception:  # noqa: BLE001 - never let logging blow up the worker
             self.handleError(record)
 
 
-def install_qt_logging(emitter: LogEmitter, verbose: bool) -> QtLogHandler:
-    """Replace the umadump logger handlers with a single Qt-backed handler."""
+def install_queue_logging(events: queue.Queue[GuiEvent], verbose: bool) -> QueueLogHandler:
+    """Replace the umadump logger handlers with a single queue-backed handler."""
 
     from logger import logger
 
-    handler = QtLogHandler(emitter)
+    handler = QueueLogHandler(events)
     logger.handlers.clear()
     logger.addHandler(handler)
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)

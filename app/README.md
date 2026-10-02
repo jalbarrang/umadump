@@ -1,7 +1,10 @@
 # umadump GUI (quick cockpit)
 
-A thin PySide6 front-end over the existing CLI pipeline. It reuses `main.py`'s
-orchestration helpers directly, so the GUI and the CLI stay on the same code path.
+A thin [Dear PyGui](https://github.com/hoffstadt/DearPyGui) front-end over the existing
+CLI pipeline. It reuses `main.py`'s orchestration helpers directly, so the GUI and the
+CLI stay on the same code path.
+
+Dear PyGui is MIT-licensed and draws its own widgets, so the bundle carries no Qt.
 
 ## What it does today
 
@@ -50,7 +53,8 @@ Or with pip inside an activated venv (`pip install -r app/requirements-build.txt
 | Linux | any host with Docker | `python app/build.py --docker` | `app/dist/linux-x86_64/umadump-gui/` + `.tar.gz` |
 
  `--no-archive` skips the archive; `--keep-build` keeps PyInstaller's intermediates.
-Rough size: ~112 MB unpacked (Windows) / ~153 MB (Linux), dominated by Qt.
+Rough size: **~27 MB unpacked**, dominated by the Python runtime and Dear PyGui's SDL2
+back end. The previous Qt build was ~106 MB.
 
 There is no macOS build. Mac users run the **Windows** bundle inside the Wine bottle
 that already hosts the game — see below.
@@ -60,16 +64,10 @@ that already hosts the game — see below.
 `app/build.py --docker` builds `app/Dockerfile.linux` and runs this same script inside
 it, so a Windows or macOS host can produce the Linux bundle.
 
-The base image is pinned by the Python 3.14 requirement rather than by Qt. PyInstaller
-needs a shared `libpython`, and Ubuntu 22.04 (glibc 2.35) plus deadsnakes `python3.14`
-is the lowest base that provides one, giving a **glibc 2.35 floor**: Ubuntu 22.04+,
-Debian 12+, RHEL 9+.
-
-The `PySide6<6.10` pin relaxed the Qt side: 6.8.3 ships its x86_64 wheel as
-`manylinux_2_28` (6.11 shipped `manylinux_2_34`), so Qt no longer sets the floor.
-Lowering it further means finding a 3.14 with a shared libpython on an older distro,
-which is untested — leave the image alone until someone verifies that. (The aarch64
-PySide6 wheel is `manylinux_2_39`, so arm64 needs glibc 2.39.)
+The base image is pinned by the Python 3.14 requirement, not by any GUI dependency.
+PyInstaller needs a shared `libpython`, and Ubuntu 22.04 (glibc 2.35) plus deadsnakes
+`python3.14` is the lowest base that provides one, giving a **glibc 2.35 floor**:
+Ubuntu 22.04+, Debian 12+, RHEL 9+. Nothing in the current dependency set raises it.
 
 ### macOS: run the Windows build in the bottle
 
@@ -99,19 +97,12 @@ Output JSON lands on Windows paths inside the bottle — `.../drive_c/umadump-du
 i.e. `~/Library/Application Support/Highball/bottles/Games/drive_c/umadump-dumps/`
 from the Mac side.
 
-**Qt must be < 6.10 or the app will not start.** Qt 6.10+ links `Qt6Core.dll` against
-the OS-provided ICU DLLs (`icuuc.dll`, `icu.dll`). Windows ships those; Wine and
-CrossOver do not, so a 6.10+ build dies at import with:
-
-```
-err:module:import_dll Library icuuc.dll (which is needed by Qt6Core.dll) not found
-```
-
-`app/requirements.txt` pins `PySide6>=6.8,<6.10` for exactly this reason. Verified on
-macOS 26.6.2 / arm64 under Highball (CrossOver 26.3 engine): PySide6 6.11.2 fails to
-import QtCore, while PySide6 6.8.3 renders a real window (`platformName: windows`, text
-and colours rasterised correctly). Rebuild the Windows bundle with the pin before
-handing it to Mac users.
+**No Qt, so none of the old Wine workarounds apply.** The Qt build had to be pinned to
+`PySide6<6.10` because Qt 6.10+ links `Qt6Core.dll` against OS-provided ICU DLLs that
+Wine and CrossOver do not ship, and it died at import with
+`err:module:import_dll Library icuuc.dll ... not found`. Dear PyGui has no such
+dependency. Verified on macOS 26.6.2 / arm64 under Highball (CrossOver 26.3 engine): the
+window renders normally.
 
 > **Run the bundle from `app/dist/`, not `app/build/`.** PyInstaller writes a bare
 > bootloader `umadump-gui.exe` into `app/build/umadump-gui/` during the build. It has
@@ -131,21 +122,34 @@ its `_internal/` folder and run the exe.
 
 Never derive it from `__file__` in a frozen build: that resolves under `_internal/` and
 would write JSON into the app's own install directory. The chosen folder (plus mode,
-paths, poll interval and checkbox states) is remembered between launches via
-`QSettings("umadump", "umadump-gui")` — the registry on Windows,
-`~/.config/umadump/umadump-gui.conf` on Linux.
+paths, poll interval and checkbox states) is remembered between launches in
+`umadump-gui.json` under the per-user config dir — `%APPDATA%\umadump\` on Windows,
+`~/.config/umadump/` on Linux, `~/Library/Application Support/umadump/` on macOS.
 
 Verify a built bundle without a display:
 
 ```powershell
 # Windows
-QT_QPA_PLATFORM=offscreen UMADUMP_SMOKE_MARKER=smoke.txt ./app/dist/windows-x86_64/umadump-gui/umadump-gui.exe --smoke-test
-cat smoke.txt   # ok window default_out=<bundle>/umadump-dumps main:extractors=12 minidump
+UMADUMP_SMOKE_MARKER=smoke.txt ./app/dist/windows-x86_64/umadump-gui/umadump-gui.exe --smoke-test
+cat smoke.txt   # ok window default_out=<bundle>/umadump-dumps main:extractors=12 minidump dearpygui
 
-# Linux (host has no Python -- the bundle is self-contained)
+# Linux (host has no Python -- the bundle is self-contained apart from libxcb1)
 docker run --rm -v "$PWD:/src" -w /src ubuntu:22.04 bash -lc \
-  'QT_QPA_PLATFORM=offscreen ./app/dist/linux-x86_64/umadump-gui/umadump-gui --smoke-test'
+  'apt-get update -qq && apt-get install -y -qq libxcb1 && \
+   ./app/dist/linux-x86_64/umadump-gui/umadump-gui --smoke-test'
 ```
+
+The smoke test builds the whole item tree but never creates a viewport, so it needs no
+display and works on a headless machine (no Xvfb, no `QT_QPA_PLATFORM`).
+
+**Linux expects `libxcb1` from the system.** PyInstaller deliberately never bundles
+`libxcb` — its ABI shifts between distro releases, so it is treated as a system library
+(see `PyInstaller/depend/dylib.py`). Every desktop install already has it; a bare
+container does not, which is why the command above installs it. Without it the bundle
+dies at import with `ImportError: libxcb.so.1: cannot open shared object file`.
+
+The `linux-<arch>` tag follows the build host, so a container on Apple silicon produces
+`linux-arm64`.
 
 ### Platform support
 
@@ -159,12 +163,12 @@ docker run --rm -v "$PWD:/src" -w /src ubuntu:22.04 bash -lc \
 
 | File | Purpose |
 |------|---------|
-| `app.py` | Entry point: `QApplication`, logging wiring, window; `--smoke-test` hook |
-| `window.py` | Main window: source config, run controls, log console |
-| `runner.py` | `ExtractionWorker` (`QThread`) driving the existing pipeline |
-| `log_bridge.py` | `logging.Handler` → Qt signal bridge for live logs |
-| `umadump-gui.spec` | PyInstaller spec (onedir, Qt add-ons excluded) |
+| `app.py` | Entry point: Dear PyGui context/viewport, logging wiring, render loop; `--smoke-test` hook |
+| `window.py` | Main window: source config, run controls, log console, settings |
+| `runner.py` | `ExtractionWorker` (`threading.Thread`) driving the existing pipeline |
+| `log_bridge.py` | `logging.Handler` → thread-safe event queue the render loop drains |
+| `umadump-gui.spec` | PyInstaller spec (onedir) |
 | `build.py` | Local build + archive script (Windows, Linux) |
 | `Dockerfile.linux` | Ubuntu 22.04 + deadsnakes builder for `--docker` (glibc 2.35 floor) |
-| `requirements.txt` | Runtime deps (PySide6, minidump) |
+| `requirements.txt` | Runtime deps (dearpygui, minidump) |
 | `requirements-build.txt` | Runtime deps + PyInstaller |
