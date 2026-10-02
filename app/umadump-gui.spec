@@ -29,7 +29,8 @@ a = Analysis(
     [str(ENTRY)],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[],
+    # Vendored UI/monospace fonts; the license texts ride along in the same folder.
+    datas=[(str(ROOT / "app" / "fonts"), "app/fonts")],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

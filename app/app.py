@@ -65,6 +65,8 @@ def _smoke_test_detail(window: MainWindow) -> str:
         import dearpygui  # noqa: F401  - the GUI toolkit
 
         checks.append("dearpygui")
+        checks.append(f"ui={Path(window.ui_font_path or 'default').name}")
+        checks.append(f"mono={Path(window.mono_font_path or 'default').name}")
         if not window.built:
             raise RuntimeError("GUI item tree was not built")
     except Exception as exc:  # noqa: BLE001

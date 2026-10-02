@@ -60,16 +60,29 @@ def platform_tag() -> str:
     return f"{system}-{machine}"
 
 
+# Names that are application output rather than content of the build. The default
+# output folder is a sibling of the bundle rather than inside it, but an older
+# artifact or a manually chosen path could still put dumps in there, and shipping a
+# user's game data inside a release archive would be both wrong and embarrassing.
+_ARCHIVE_SKIP_DIRS = frozenset({"umadump-dumps"})
+
+
 def make_archive(bundle: Path, out: Path) -> None:
     """Archive *bundle* preserving the executable bit and symlinks."""
+
+    def included(path: Path) -> bool:
+        return not any(part in _ARCHIVE_SKIP_DIRS for part in path.relative_to(bundle).parts)
+
     if platform.system() == "Windows":
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
             for path in sorted(bundle.rglob("*")):
-                if path.is_file():
+                if path.is_file() and included(path):
                     zf.write(path, path.relative_to(bundle.parent))
     else:
         with tarfile.open(out, "w:gz") as tf:
-            tf.add(bundle, arcname=bundle.name)
+            for path in sorted(bundle.rglob("*")):
+                if included(path):
+                    tf.add(path, arcname=str(Path(bundle.name) / path.relative_to(bundle)), recursive=False)
 
 
 def find_bundle(platform_dir: Path) -> Path | None:

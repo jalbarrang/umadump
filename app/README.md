@@ -118,13 +118,33 @@ its `_internal/` folder and run the exe.
 | Context | Default output folder |
 |---------|-----------------------|
 | From source (`python app/app.py`) | the repository root |
-| Frozen bundle | `umadump-dumps/` next to the executable |
+| Frozen bundle | `umadump-dumps/` **beside** the bundle folder, never inside it |
 
-Never derive it from `__file__` in a frozen build: that resolves under `_internal/` and
-would write JSON into the app's own install directory. The chosen folder (plus mode,
-paths, poll interval and checkbox states) is remembered between launches in
-`umadump-gui.json` under the per-user config dir — `%APPDATA%\umadump\` on Windows,
-`~/.config/umadump/` on Linux, `~/Library/Application Support/umadump/` on macOS.
+Never derive it from `__file__` in a frozen build: that resolves under `_internal/`. The
+same trap applies to `sys.executable.parent`, which for a onedir build *is* the bundle
+folder — so an earlier version wrote user dumps into `umadump-gui/umadump-dumps/`, inside
+the very folder that gets archived, and a rebuild afterwards would have shipped that game
+data. Frozen builds now step out of the bundle, and `build.py` additionally refuses to
+put a `umadump-dumps/` folder into any archive as a second line of defence.
+
+The chosen folder (plus mode, paths, poll interval and checkbox states) is remembered
+between launches in `umadump-gui.json` under the per-user config dir —
+`%APPDATA%\umadump\` on Windows, `~/.config/umadump/` on Linux,
+`~/Library/Application Support/umadump/` on macOS.
+
+### Fonts
+
+The GUI bundles its own fonts in `app/fonts/` rather than depending on the host:
+
+| Role | Font | Size | License |
+|------|------|------|---------|
+| UI | Roboto | 16 px | Apache-2.0 |
+| Log console | JetBrains Mono | 14 px | OFL-1.1 |
+
+Dear PyGui's built-in face is an ASCII-only bitmap font that renders `...` as `?`.
+System fonts (Segoe UI/Consolas, DejaVu, Liberation) are still tried after the bundled
+ones as a fallback, and user-facing strings are ASCII throughout so the GUI stays
+correct even if every font is missing. See `app/fonts/README.md` for provenance.
 
 Verify a built bundle without a display:
 

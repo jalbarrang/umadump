@@ -41,11 +41,31 @@ _DEFAULT_LOG_COLOR: Final = (216, 216, 216, 255)
 _OPEN_WITH: Final[dict[str, str]] = {"win32": "explorer", "darwin": "open"}
 
 # Dear PyGui ships a small ASCII-only bitmap font (ProggyClean), which renders "..."
-# and "-" as '?' and looks dated. Bind a real system font instead. DPG 2.x builds
-# the atlas from the whole file, so no explicit glyph ranges are needed. Candidate
-# lists are per-platform, and a Wine bottle has neither Segoe UI nor Consolas, so
-# the fallbacks matter.
+# and "-" as '?' and looks dated, so real fonts are shipped with the app:
+#
+#   * Roboto (Apache-2.0) for the UI
+#   * JetBrains Mono (OFL-1.1) for the log console
+#
+# Both live in ``app/fonts`` and are bundled by the PyInstaller spec. DPG 2.x builds
+# the glyph atlas from the whole file, so no explicit glyph ranges are needed. System
+# fonts stay in the lists as fallbacks for a stripped bundle or a bare install, since
+# a Wine bottle has neither of the bundled families.
+_UI_FONT_SIZE: Final = 16
+_MONO_FONT_SIZE: Final = 14
+
+
+def _bundled_font_dir() -> Path:
+    """Directory holding the vendored fonts, frozen or from source.
+
+    PyInstaller places ``datas`` under ``sys._MEIPASS`` (``_internal/`` in a onedir
+    build); from source they sit beside this module.
+    """
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+    return base / "app" / "fonts"
+
+
 _UI_FONT_CANDIDATES: Final[tuple[str, ...]] = (
+    str(_bundled_font_dir() / "Roboto-Regular.ttf"),
     r"C:\Windows\Fonts\segoeui.ttf",
     r"C:\Windows\Fonts\tahoma.ttf",
     r"C:\Windows\Fonts\arial.ttf",
@@ -57,6 +77,7 @@ _UI_FONT_CANDIDATES: Final[tuple[str, ...]] = (
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
 )
 _MONO_FONT_CANDIDATES: Final[tuple[str, ...]] = (
+    str(_bundled_font_dir() / "JetBrainsMono-Regular.ttf"),
     r"C:\Windows\Fonts\consola.ttf",
     r"C:\Windows\Fonts\lucon.ttf",
     r"C:\Windows\Fonts\cour.ttf",
@@ -65,8 +86,6 @@ _MONO_FONT_CANDIDATES: Final[tuple[str, ...]] = (
     "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
     "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
 )
-_UI_FONT_SIZE: Final = 16
-_MONO_FONT_SIZE: Final = 15
 
 # Vertical room the log must leave for the separator and status line under it.
 # A child window sized ``-1`` swallows the rest of the window and the status text
@@ -83,14 +102,21 @@ def _first_existing_font(candidates: tuple[str, ...]) -> str | None:
 
 
 def _default_output_dir() -> Path:
-    """Default dump location.
+    """Default dump location, never inside the application bundle.
 
-    In a PyInstaller bundle ``__file__`` lives under ``_internal/``, so deriving a
-    default from it would write JSON *inside* the app's own install directory.
-    Frozen builds therefore default to a sibling folder next to the executable.
+    A onedir build's ``sys.executable`` sits at the top of the bundle directory, so
+    writing beside it drops user dumps into the app folder itself -- and from there
+    into any archive built afterwards. Frozen builds therefore step outside the
+    bundle folder and use a sibling of it.
     """
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent / "umadump-dumps"
+        exe_dir = Path(sys.executable).resolve().parent
+        # onedir: _MEIPASS is the bundle's contents directory, so its parent is the
+        # bundle root; onefile: _MEIPASS is a temp dir, so this does not match.
+        meipass = Path(getattr(sys, "_MEIPASS", exe_dir)).resolve()
+        if meipass != exe_dir and meipass.parent == exe_dir:
+            exe_dir = exe_dir.parent
+        return exe_dir / "umadump-dumps"
     return PROJECT_ROOT
 
 
@@ -143,6 +169,8 @@ class MainWindow:
         self._worker: ExtractionWorker | None = None
         self._default_output_dir = _default_output_dir()
         self._mono_font: int | str | None = None
+        self.ui_font_path: str | None = None
+        self.mono_font_path: str | None = None
         self._log_items: deque[int | str] = deque()
         self._wrap_width: int = -1
         self.built = False
@@ -245,18 +273,18 @@ class MainWindow:
             pass
 
     def _load_fonts(self) -> None:
-        """Bind real UI/mono fonts when the OS has them, else keep DPG's default."""
-        ui_path = _first_existing_font(_UI_FONT_CANDIDATES)
-        mono_path = _first_existing_font(_MONO_FONT_CANDIDATES)
-        if ui_path is None and mono_path is None:
+        """Bind the bundled UI/mono fonts, falling back to system ones, then DPG's default."""
+        self.ui_font_path = _first_existing_font(_UI_FONT_CANDIDATES)
+        self.mono_font_path = _first_existing_font(_MONO_FONT_CANDIDATES)
+        if self.ui_font_path is None and self.mono_font_path is None:
             return
         with dpg.font_registry():
-            if ui_path is not None:
-                with dpg.font(ui_path, _UI_FONT_SIZE) as ui_font:
+            if self.ui_font_path is not None:
+                with dpg.font(self.ui_font_path, _UI_FONT_SIZE) as ui_font:
                     pass
                 dpg.bind_font(ui_font)
-            if mono_path is not None:
-                with dpg.font(mono_path, _MONO_FONT_SIZE) as mono_font:
+            if self.mono_font_path is not None:
+                with dpg.font(self.mono_font_path, _MONO_FONT_SIZE) as mono_font:
                     pass
                 self._mono_font = mono_font
 
