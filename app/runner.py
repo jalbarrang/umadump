@@ -67,12 +67,12 @@ class ExtractionWorker(threading.Thread):
             if self.update_check:
                 notify_if_update_available(CURRENT_VERSION)
 
-            self._events.put(StateEvent("Opening memory backend…"))
+            self._events.put(StateEvent("Opening memory backend..."))
             setup = setup_memory(self.minidump, self.metadata_path)
             logger.info("Metadata path: %s", setup.metadata_path)
 
             with setup.mem:
-                self._events.put(StateEvent("Resolving IL2CPP runtime & validating schemas…"))
+                self._events.put(StateEvent("Resolving IL2CPP runtime & validating schemas..."))
                 try:
                     resolver = build_resolver(setup.mem, setup.metadata_path)
                 finally:
@@ -84,7 +84,7 @@ class ExtractionWorker(threading.Thread):
                     self._events.put(FinishedEvent("Schema validation passed"))
                     return
 
-                self._events.put(StateEvent("Resolving singletons…"))
+                self._events.put(StateEvent("Resolving singletons..."))
                 umadump_main._prepare_memory_pass(setup.mem)
                 try:
                     logger.info(
@@ -101,7 +101,7 @@ class ExtractionWorker(threading.Thread):
                     self._run_daemon(setup, resolver, singleton_index, roots)
                     return
 
-                self._events.put(StateEvent("Running extractors…"))
+                self._events.put(StateEvent("Running extractors..."))
                 elapsed = umadump_main._run_extractor_pass(
                     setup.mem, resolver, singleton_index, roots, umadump_main.ExtractionRunState()
                 )
@@ -123,7 +123,7 @@ class ExtractionWorker(threading.Thread):
 
         state = umadump_main.ExtractionRunState()
         logger.info("Daemon mode started; polling every %.2fs", self.poll_interval)
-        self._events.put(StateEvent("Daemon running — press Stop to finish"))
+        self._events.put(StateEvent("Daemon running - press Stop to finish"))
         pass_num = 1
         while not self._stop.is_set() and setup.mem.is_alive():
             elapsed = umadump_main._run_extractor_pass(setup.mem, resolver, singleton_index, roots, state)
