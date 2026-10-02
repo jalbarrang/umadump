@@ -4,3 +4,7 @@ __pycache__/
 app/.venv/
 app/build/
 app/dist/
+
+# macOS
+.DS_Store
+._*
